@@ -165,6 +165,74 @@ TASKS: list[Task] = [
         },
         acceptance=[{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
     ),
+    Task(
+        key="compat_rename",
+        goal="把 area 改名为 compute_area，更新调用点，但保留 area 作为兼容别名",
+        initial={
+            "lib/__init__.py": "",
+            "lib/core.py": "def area(w, h):\n    return w * h\n",
+            "lib/api.py": (
+                "from lib.core import area\n\n\ndef rect(w, h):\n    return area(w, h)\n"
+            ),
+            "tests/test_api.py": (
+                "import unittest\nfrom lib.api import rect\n\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_rect(self):\n"
+                "        self.assertEqual(rect(2, 3), 6)\n"
+            ),
+            "tests/test_compat.py": (
+                "import unittest\nfrom lib.core import area\n\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_old_name_still_works(self):\n"
+                "        self.assertEqual(area(2, 3), 6)\n"
+            ),
+        },
+        correct={
+            "lib/core.py": (
+                "def compute_area(w, h):\n    return w * h\n\n\n"
+                "area = compute_area  # deprecated alias\n"
+            ),
+            "lib/api.py": (
+                "from lib.core import compute_area\n\n\ndef rect(w, h):\n    return compute_area(w, h)\n"
+            ),
+        },
+        wrong={
+            "lib/core.py": "def compute_area(w, h):\n    return w * h\n",
+            "lib/api.py": (
+                "from lib.core import compute_area\n\n\ndef rect(w, h):\n    return compute_area(w, h)\n"
+            ),
+        },
+        acceptance=[{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
+    ),
+    Task(
+        key="noisy_fix",
+        goal="修复折扣计算，让 tests/test_pricing.py 通过",
+        initial={
+            "app/__init__.py": "",
+            "app/pricing.py": "def total(prices, pct):\n    return sum(prices) * pct / 100\n",
+            "app/legacy/pricing.py": (
+                "# old implementation, no longer imported\ndef total(prices, pct):\n"
+                "    return sum(prices) * pct / 100\n"
+            ),
+            "app/legacy/__init__.py": "",
+            "tests/test_pricing.py": (
+                "import unittest\nfrom app.pricing import total\n\n\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_total(self):\n"
+                "        self.assertEqual(total([100, 200], 10), 270)\n"
+            ),
+        },
+        correct={
+            "app/pricing.py": "def total(prices, pct):\n    return sum(prices) * (100 - pct) / 100\n",
+        },
+        wrong={
+            "app/legacy/pricing.py": (
+                "# old implementation, no longer imported\ndef total(prices, pct):\n"
+                "    return sum(prices) * (100 - pct) / 100\n"
+            ),
+        },
+        acceptance=[{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
+    ),
 ]
 
 
