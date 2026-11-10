@@ -125,11 +125,18 @@ class Tools:
         return self.run(f'"{sys.executable}" -c {_q(script)} ' + " ".join(_q(a) for a in args), cwd=cwd)
 
     def write(self, path: str, content: str) -> Observation:
+        if not path.strip():
+            return Observation("write", False, 2, "", "empty path")
         self._guard("write", path)
         self._charge()
         target = self._resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        if target.is_dir():
+            return Observation("write", False, 2, "", f"{path} is a directory")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return Observation("write", False, 2, "", f"write failed: {exc}")
         return Observation("write", True, 0, f"wrote {len(content)} chars to {path}")
 
     def read(self, path: str) -> Observation:

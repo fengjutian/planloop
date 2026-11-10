@@ -126,6 +126,7 @@ class Blackboard:
         acceptance: str = "",
         max_chars: int = 1400,
         compressor=None,
+        include_observations: bool = True,
     ) -> str:
         """Assemble the minimal, relevant slice for one node."""
         parts: list[str] = [f"# Global goal\n{goal}"]
@@ -153,7 +154,7 @@ class Blackboard:
         if relevant:
             parts.append("# Project facts\n" + "\n".join(f"- {k}: {v}" for k, v in relevant))
 
-        obs = self.observations.get(node_id, [])[-2:]
+        obs = self.observations.get(node_id, [])[-2:] if include_observations else []
         if obs:
             parts.append("# Recent observations\n" + "\n".join(f"> {o[-400:]}" for o in obs))
 

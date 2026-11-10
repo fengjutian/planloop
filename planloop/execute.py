@@ -29,6 +29,7 @@ ACT_PROMPT = """task=act
 Reply with exactly one JSON object, no prose:
 {{"action": "run",  "cmd": "<shell command>"}}
 {{"action": "write","path": "<file>", "content": "<full file content>"}}
+{{action: write_many,files: {{<file>: <content>, <file2>: <content>}}}}
 {{"action": "read", "path": "<file>"}}
 {{"action": "finish","summary": "<what you did, <=2 sentences>"}}
 Work in the workspace root. Prefer small, verifiable steps.
@@ -94,6 +95,7 @@ class Executor:
 
         self.router = router if router is not None else ModelRouter.single(model)
         self._tier_by_node: dict[str, str] = {}
+        self._file_snapshots: dict[str, dict[str, str]] = {}
         self.context_files = list(context_files)
         self.tools = Tools(
             workspace, ledger=ledger, phase="execute",
@@ -125,7 +127,7 @@ class Executor:
             return "", []
         return "\n\n".join(sections) + "\n", lesson_ids
 
-    def _files_block(self, *, limit: int = 8000) -> str:
+    def _files_block(self, node: TaskNode, *, limit: int = 8000) -> str:
         """Current contents of the files the task declared as context.
 
         Read every step on purpose: a file the node just wrote must not appear
@@ -133,7 +135,8 @@ class Executor:
         """
         chunks: list[str] = []
         used = 0
-        for rel in self.context_files:
+        wanted = node.context_files or self.context_files
+        for rel in wanted:
             target = (self.workspace / rel) if not Path(rel).is_absolute() else Path(rel)
             try:
                 text = target.read_text(encoding="utf-8")
@@ -147,8 +150,15 @@ class Executor:
                 break
         return "\n".join(chunks)
 
-    def _prompt(self, node: TaskNode, plan: Plan, extra: str, memory_block: str) -> str:
-        context = self.bb.context_for(
+    def _prompt(self, node: TaskNode, plan: Plan, extra: str, memory_block: str, *, step: int = 0) -> str:
+        """Stable content first, volatile content last.
+
+        The provider caches prompt prefixes (measured: ~100% of a repeated
+        prefix).  Anything that changes every step -- observations, corrections,
+        memory hits -- therefore has to sit at the *end*, or it would invalidate
+        the cache for the files that follow it.
+        """
+        stable = self.bb.context_for(
             node_id=node.id,
             goal=plan.goal,
             node_goal=node.goal,
@@ -156,11 +166,25 @@ class Executor:
             contracts=node.contracts_text(),
             acceptance=node.acceptance_text(),
             compressor=self.compressor,
+            include_observations=False,
         )
-        files = self._files_block()
+        # measured: sending files only once raises cache hits (33% -> ~50%) but
+        # breaks correctness -- the model does not re-read and writes stale code
+        files = self._files_block(node)
         if files:
-            context = context + "\n\n# Relevant files (current contents)\n" + files
-        return ACT_PROMPT.format(context=context, memory_block=memory_block, extra=extra or "")
+            stable += "\n\n# Relevant files (current contents)\n" + files
+        volatile = self._observations_block(node)
+        return ACT_PROMPT.format(
+            context=stable,
+            memory_block=volatile + memory_block,
+            extra=extra or "",
+        )
+
+    def _observations_block(self, node: TaskNode) -> str:
+        obs = self.bb.observations.get(node.id, [])[-2:]
+        if not obs:
+            return ""
+        return "# Recent observations\n" + "\n".join(f"> {o[-400:]}" for o in obs) + "\n\n"
 
     def _l1(self, node: TaskNode, evidence: str) -> VerificationReport | None:
         if not any(c.layer == "L1" for c in node.acceptance):
@@ -187,7 +211,7 @@ class Executor:
                 outcome.last_error = self.ledger.exhausted() or "budget"
                 break
 
-            prompt = self._prompt(node, plan, extra_context, memory_block)
+            prompt = self._prompt(node, plan, extra_context, memory_block, step=step)
             try:
                 comp, decision = self.router.complete(
                     prompt,
@@ -195,7 +219,7 @@ class Executor:
                     est_cost=node.est_cost,
                     risk=node.risk,
                     lesson_hit=bool(lesson_ids),
-                    max_tokens=1200,
+                    max_tokens=max(1200, 600 * max(1, len(node.context_files or self.context_files))),
                 )
             except Exception as exc:  # noqa: BLE001 - a model failure is a step failure
                 outcome.last_error = f"model error: {exc}"
@@ -228,6 +252,21 @@ class Executor:
                 obs = self.tools.write(path, str(action.get("content", "")))
                 if obs.ok:
                     outcome.files.append(path)
+            elif kind == "write_many":
+                files = action.get("files") or {}
+                written, failed = [], []
+                for path, content in files.items():
+                    single = self.tools.write(str(path), str(content))
+                    if single.ok:
+                        written.append(str(path))
+                        outcome.files.append(str(path))
+                    else:
+                        failed.append(f"{path}: {single.stderr[:80]}")
+                obs = Observation(
+                    "write_many", not failed, 0 if not failed else 2,
+                    f"wrote {len(written)} files",
+                    "; ".join(failed),
+                )
             elif kind == "read":
                 obs = self.tools.read(str(action.get("path", "")))
             elif kind == "finish":

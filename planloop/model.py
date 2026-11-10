@@ -25,6 +25,7 @@ class Completion:
     text: str
     tokens_in: int = 0
     tokens_out: int = 0
+    cached_tokens: int = 0
 
     @property
     def tokens(self) -> int:
@@ -184,6 +185,7 @@ class OpenAICompatModel:
         except urllib.error.HTTPError as exc:  # pragma: no cover - network path
             raise RuntimeError(f"model HTTP {exc.code}: {exc.read()[:400]!r}") from exc
         usage = data.get("usage") or {}
+        cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         # reasoning models may return an empty `content` when they hit the token
@@ -198,6 +200,7 @@ class OpenAICompatModel:
             )
         return Completion(
             text=text,
+            cached_tokens=cached,
             tokens_in=int(usage.get("prompt_tokens", estimate_tokens(prompt))),
             tokens_out=int(usage.get("completion_tokens", estimate_tokens(text))),
         )

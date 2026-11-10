@@ -101,6 +101,8 @@ class TaskNode:
     attempts: int = 0
     depth: int = 0
     milestone: str = ""
+    #: files this node needs; empty means "use the spec-level default"
+    context_files: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "TaskNode":
@@ -130,6 +132,7 @@ class TaskNode:
             risk=str(raw.get("risk", "low")),
             reversible=bool(raw.get("reversible", True)),
             milestone=str(raw.get("milestone", "")),
+            context_files=[str(p) for p in raw.get("context_files") or []],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,6 +149,8 @@ class TaskNode:
         }
         if self.milestone:
             out["milestone"] = self.milestone
+        if self.context_files:
+            out["context_files"] = list(self.context_files)
         if self.depth:
             out["depth"] = self.depth
         return out
