@@ -9,22 +9,22 @@
 
 | config | success_rate | mean_tokens | runs |
 |---|---|---|---|
-| B0 | 17% | 2802 | 6 |
-| B2 | 17% | 7129 | 6 |
+| B0 | 100% | 12852 | 6 |
+| B2 | 33% | 6612 | 6 |
 
 ## 按任务
 
 | task | config | success | tokens |
 |---|---|---|---|
-| rename_chain_3 | B0 | no | 1540 |
-| rename_chain_3 | B2 | no | 8178 |
-| rename_chain_4 | B0 | yes | 8062 |
-| rename_chain_4 | B2 | yes | 12080 |
-| rename_chain_5 | B0 | no | 1690 |
-| rename_chain_5 | B2 | no | 8014 |
-| rename_chain_6 | B0 | no | 1765 |
-| rename_chain_6 | B2 | no | 1116 |
-| rename_chain_7 | B0 | no | 1840 |
-| rename_chain_7 | B2 | no | 5368 |
-| rename_chain_8 | B0 | no | 1915 |
-| rename_chain_8 | B2 | no | 8017 |
+| rename_chain_3 | B0 | yes | 3714 |
+| rename_chain_3 | B2 | yes | 6475 |
+| rename_chain_4 | B0 | yes | 4177 |
+| rename_chain_4 | B2 | no | 5575 |
+| rename_chain_5 | B0 | yes | 17177 |
+| rename_chain_5 | B2 | no | 8904 |
+| rename_chain_6 | B0 | yes | 16848 |
+| rename_chain_6 | B2 | yes | 7425 |
+| rename_chain_7 | B0 | yes | 11640 |
+| rename_chain_7 | B2 | no | 2094 |
+| rename_chain_8 | B0 | yes | 23557 |
+| rename_chain_8 | B2 | no | 9196 |

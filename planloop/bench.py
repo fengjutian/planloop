@@ -69,7 +69,7 @@ class Task:
                     {"id": "SC1", "kind": "command", "spec": self.oracle, "must": "exit=0"}
                 ],
                 "context_files": sorted(self.initial),
-                "limits": {"max_attempts_per_node": 2, "max_steps_per_node": 4},
+                "limits": {"max_attempts_per_node": 2, "max_steps_per_node": 8},
                 "plan_template": {
                     "nodes": self.plan
                     or [
@@ -590,11 +590,6 @@ def make_rename_chain(index: int, *, callers: int) -> Task:
                 "id": "T1",
                 "goal": f"改名 {module}/core.py 并更新 {module}/__init__.py 的别名",
                 "est_cost": 0.2,
-                "context_files": [
-                    f"{module}/core.py",
-                    f"{module}/__init__.py",
-                    "tests/test_core.py",
-                ],
                 "acceptance": [{"id": "A1", "kind": "command",
                                 "spec": f"{PY} -m unittest {module.replace('/', '.')} tests.test_core -q",
                                 "must": "exit=0"}],
@@ -604,8 +599,6 @@ def make_rename_chain(index: int, *, callers: int) -> Task:
                 "deps": ["T1"],
                 "goal": f"更新全部 {callers} 个调用点，让全量测试通过",
                 "est_cost": 0.7,
-                "context_files": [f"{module}/c{i}.py" for i in range(callers)]
-                + [f"{module}/core.py", f"{module}/__init__.py"],
                 "acceptance": [{"id": "A2", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
             },
         ],
