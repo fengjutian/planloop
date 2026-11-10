@@ -392,16 +392,20 @@ class Report:
 
 
 def benchmark(*, reps: int = 5, p_correct: float = 0.6, seed: int = 0,
-              tasks: list[Task] | None = None, n_best: int = 3) -> Report:
+              tasks: list[Task] | None = None, n_best: int = 3,
+              configs: tuple[str, ...] = ("B0", "B1", "B2")) -> Report:
     rng = random.Random(seed)
     report = Report(reps=reps, p_correct=p_correct, seed=seed)
     for _ in range(reps):
         for task in tasks or TASKS:
-            for runner in (
-                lambda: run_b0(task, p_correct=p_correct, rng=rng),
-                lambda: run_b1(task, p_correct=p_correct, rng=rng, n=n_best),
-                lambda: run_b2(task, p_correct=p_correct, rng=rng),
-            ):
+            runners = []
+            if "B0" in configs:
+                runners.append(lambda: run_b0(task, p_correct=p_correct, rng=rng))
+            if "B1" in configs:
+                runners.append(lambda: run_b1(task, p_correct=p_correct, rng=rng, n=n_best))
+            if "B2" in configs:
+                runners.append(lambda: run_b2(task, p_correct=p_correct, rng=rng))
+            for runner in runners:
                 outcome = runner()
                 report.outcomes.append(outcome)
                 print(

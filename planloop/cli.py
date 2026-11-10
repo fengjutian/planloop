@@ -381,7 +381,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         return 2
 
     report = bench.benchmark(
-        reps=args.reps, p_correct=args.p_correct, seed=args.seed, tasks=tasks, n_best=args.n_best
+        reps=args.reps, p_correct=args.p_correct, seed=args.seed, tasks=tasks,
+        n_best=args.n_best, configs=tuple(c.strip().upper() for c in args.configs.split(",") if c.strip()),
     )
     text = report.to_markdown()
     if args.out:
@@ -452,6 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--base-url", default="", dest="base_url")
     bench.add_argument("--n-best", type=int, default=3, dest="n_best")
     bench.add_argument("--tasks", default="", help="comma separated task keys")
+    bench.add_argument("--configs", default="B0,B1,B2", help="which configs to run")
     bench.add_argument("-w", "--workspace", default=".")
     bench.set_defaults(func=_cmd_bench)
 
