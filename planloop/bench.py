@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from planloop.model import Completion, estimate_tokens
+
+from planloop.model import Completion, OpenAICompatModel, estimate_tokens
 from planloop.scheduler import run as planloop_run
 from planloop.spec import ProblemSpec
 from planloop.tools import Tools
@@ -201,17 +203,69 @@ class AttemptModel:
         return Completion(text=text, tokens_in=estimate_tokens(prompt), tokens_out=estimate_tokens(text))
 
 
-def _act(task: Task, root: Path, model: AttemptModel, *, max_steps: int = 4) -> int:
+PROTOCOL = """You are working in a small repository. Reply with exactly ONE JSON object:
+{"action": "read", "path": "<file>"}
+{"action": "write", "path": "<file>", "content": "<full file content>"}
+{"action": "run", "cmd": "<shell command>"}
+{"action": "finish", "summary": "<what you did>"}
+
+Current files:
+{files}
+
+Goal: {goal}
+"""
+
+
+def task_prompt(task: Task, root: Path, *, limit: int = 4000) -> str:
+    chunks = []
+    budget = limit
+    for path in sorted(task.initial):
+        target = root / path
+        if not target.exists():
+            continue
+        text = target.read_text(encoding="utf-8")
+        budget -= len(text)
+        if budget < 0:
+            break
+        chunks.append(f"--- {path} ---\n{text}")
+    return PROTOCOL.replace("{files}", "\n".join(chunks)).replace("{goal}", task.goal)
+
+
+def real_model_factory(model_name: str, base_url: str, api_key: str):
+    def build(task: Task, rng=None):
+        return OpenAICompatModel(model_name, base_url=base_url, api_key=api_key, temperature=0.2)
+
+    return build
+
+
+def scripted_model_factory(p_correct: float):
+    def build(task: Task, rng):
+        return AttemptModel(task, p_correct=p_correct, rng=rng)
+
+    return build
+
+
+#: set by the CLI when a real endpoint is configured
+MODEL_FACTORY = None
+
+
+def _make(task: Task, p_correct: float, rng: random.Random):
+    if MODEL_FACTORY is not None:
+        return MODEL_FACTORY(task, rng)
+    return AttemptModel(task, p_correct=p_correct, rng=rng)
+
+
+def _act(task: Task, root: Path, model, *, max_steps: int = 6) -> int:
     """The B0 primitive: act until the model says finish. No verification."""
     tools = Tools(root)
-    prompt = f"task=act\n# Current node T1\n{task.goal}\n"
     tokens = 0
     for _ in range(max_steps):
+        prompt = task_prompt(task, root)
         comp = model.complete(prompt)
         tokens += comp.tokens
         try:
-            action = json.loads(comp.text)
-        except json.JSONDecodeError:
+            action = json.loads(_extract(comp.text))
+        except (ValueError, json.JSONDecodeError):
             break
         kind = action.get("action")
         if kind == "write":
@@ -221,6 +275,12 @@ def _act(task: Task, root: Path, model: AttemptModel, *, max_steps: int = 4) -> 
         elif kind == "finish":
             break
     return tokens
+
+
+def _extract(text: str) -> str:
+    """Reasoning models prefix a <think> block; keep the first JSON object."""
+    match = re.search(r"\{.*\}", text, re.S)
+    return match.group(0) if match else text
 
 
 # --------------------------------------------------------------------------
@@ -241,13 +301,13 @@ def run_b0(task: Task, *, p_correct: float, rng: random.Random) -> Outcome:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         task.build(root)
-        model = AttemptModel(task, p_correct=p_correct, rng=rng)
+        model = _make(task, p_correct, rng)
         tokens = _act(task, root, model)
         success = task.passes(root)
     return Outcome("B0", task.key, success, tokens, 1, time.monotonic() - started)
 
 
-def run_b1(task: Task, *, p_correct: float, rng: random.Random, n: int = 5) -> Outcome:
+def run_b1(task: Task, *, p_correct: float, rng: random.Random, n: int = 3) -> Outcome:
     """N attempts, keep the most common artefact set. Still no verification."""
     started = time.monotonic()
     votes: dict[str, int] = {}
@@ -256,7 +316,7 @@ def run_b1(task: Task, *, p_correct: float, rng: random.Random, n: int = 5) -> O
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task.build(root)
-            model = AttemptModel(task, p_correct=p_correct, rng=rng)
+            model = _make(task, p_correct, rng)
             tokens += _act(task, root, model)
             fingerprint = "\n".join(
                 f"{p}:{(root / p).read_text(encoding='utf-8')}"
@@ -273,10 +333,10 @@ def run_b2(task: Task, *, p_correct: float, rng: random.Random) -> Outcome:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         task.build(root)
-        model = AttemptModel(task, p_correct=p_correct, rng=rng)
+        model = _make(task, p_correct, rng)
         result = planloop_run(task.spec(), model=model, workspace=root)
         tokens = result.usage.get("tokens", 0)
-        attempts = model.attempts or 1
+        attempts = getattr(model, "attempts", 1) or 1
         success = task.passes(root)
     return Outcome("B2", task.key, success, tokens, attempts, time.monotonic() - started)
 
@@ -330,12 +390,13 @@ class Report:
         return "\n".join(lines) + "\n"
 
 
-def benchmark(*, reps: int = 5, p_correct: float = 0.6, seed: int = 0, tasks: list[Task] | None = None) -> Report:
+def benchmark(*, reps: int = 5, p_correct: float = 0.6, seed: int = 0,
+              tasks: list[Task] | None = None, n_best: int = 3) -> Report:
     rng = random.Random(seed)
     report = Report(reps=reps, p_correct=p_correct, seed=seed)
     for _ in range(reps):
         for task in tasks or TASKS:
             report.outcomes.append(run_b0(task, p_correct=p_correct, rng=rng))
-            report.outcomes.append(run_b1(task, p_correct=p_correct, rng=rng))
+            report.outcomes.append(run_b1(task, p_correct=p_correct, rng=rng, n=n_best))
             report.outcomes.append(run_b2(task, p_correct=p_correct, rng=rng))
     return report

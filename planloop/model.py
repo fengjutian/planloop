@@ -184,7 +184,18 @@ class OpenAICompatModel:
         except urllib.error.HTTPError as exc:  # pragma: no cover - network path
             raise RuntimeError(f"model HTTP {exc.code}: {exc.read()[:400]!r}") from exc
         usage = data.get("usage") or {}
-        text = data["choices"][0]["message"]["content"]
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        # reasoning models may return an empty `content` when they hit the token
+        # cap while thinking; fall back to the reasoning channel, then to a
+        # readable error rather than a KeyError deep inside the harness.
+        text = message.get("content") or message.get("reasoning_content") or ""
+        if not text:
+            finish = choice.get("finish_reason", "?")
+            raise RuntimeError(
+                f"model returned no content (finish_reason={finish}); "
+                "raise max_tokens or lower the prompt size"
+            )
         return Completion(
             text=text,
             tokens_in=int(usage.get("prompt_tokens", estimate_tokens(prompt))),

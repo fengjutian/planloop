@@ -26,7 +26,7 @@ class BenchTest(unittest.TestCase):
     def test_b1_uses_more_attempts_than_b0(self):
         task = TASKS[0]
         zero = run_b0(task, p_correct=1.0, rng=random.Random(1))
-        five = run_b1(task, p_correct=1.0, rng=random.Random(1))
+        five = run_b1(task, p_correct=1.0, rng=random.Random(1), n=5)
         self.assertEqual(zero.attempts, 1)
         self.assertEqual(five.attempts, 5)
         self.assertGreater(five.tokens, zero.tokens)

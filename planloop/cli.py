@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -350,10 +351,38 @@ def _cmd_approvals(args: argparse.Namespace) -> int:
     return 2
 
 
-def _cmd_bench(args: argparse.Namespace) -> int:
-    from planloop.bench import benchmark
+def _local_api_key(workspace: Path | str) -> str:
+    """Read the key from the git-ignored credentials file, if present."""
+    candidate = Path(workspace) / ".planloop" / "credentials.env"
+    if not candidate.exists():
+        return ""
+    for line in candidate.read_text(encoding="ascii").splitlines():
+        if line.startswith("PLANLOOP_API_KEY="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
-    report = benchmark(reps=args.reps, p_correct=args.p_correct, seed=args.seed)
+
+def _cmd_bench(args: argparse.Namespace) -> int:
+    import planloop.bench as bench
+
+    if args.real:
+        model = args.model or os.environ.get("PLANLOOP_MODEL") or "MiniMax-M3"
+        base = args.base_url or os.environ.get("PLANLOOP_BASE_URL") or "https://api.minimax.chat/v1"
+        key = os.environ.get("PLANLOOP_API_KEY") or _local_api_key(args.workspace)
+        if not key:
+            print("no API key: set PLANLOOP_API_KEY or .planloop/credentials.env", file=sys.stderr)
+            return 2
+        bench.MODEL_FACTORY = bench.real_model_factory(model, base, key)
+        print(f"using real model {model} @ {base}")
+
+    tasks = [t for t in bench.TASKS if not args.tasks or t.key in args.tasks.split(",")]
+    if not tasks:
+        print(f"no tasks matched {args.tasks!r}", file=sys.stderr)
+        return 2
+
+    report = bench.benchmark(
+        reps=args.reps, p_correct=args.p_correct, seed=args.seed, tasks=tasks, n_best=args.n_best
+    )
     text = report.to_markdown()
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
@@ -418,6 +447,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--p-correct", type=float, default=0.6, dest="p_correct")
     bench.add_argument("--seed", type=int, default=0)
     bench.add_argument("--out", default="")
+    bench.add_argument("--real", action="store_true", help="use a real model instead of the scripted one")
+    bench.add_argument("--model", default="")
+    bench.add_argument("--base-url", default="", dest="base_url")
+    bench.add_argument("--n-best", type=int, default=3, dest="n_best")
+    bench.add_argument("--tasks", default="", help="comma separated task keys")
+    bench.add_argument("-w", "--workspace", default=".")
     bench.set_defaults(func=_cmd_bench)
 
     approvals = sub.add_parser("approvals", help="review high-risk actions")
