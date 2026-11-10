@@ -52,6 +52,8 @@ class Task:
     wrong: dict[str, str]
     acceptance: list[dict[str, Any]]
     oracle: str = FULL_SUITE
+    #: optional multi-node plan; default is a single node
+    plan: list[dict[str, Any]] | None = None
 
     def build(self, root: Path) -> None:
         for path, content in self.initial.items():
@@ -69,7 +71,8 @@ class Task:
                 "context_files": sorted(self.initial),
                 "limits": {"max_attempts_per_node": 2, "max_steps_per_node": 4},
                 "plan_template": {
-                    "nodes": [
+                    "nodes": self.plan
+                    or [
                         {"id": "T1", "goal": self.goal, "est_cost": 0.5, "acceptance": self.acceptance}
                     ]
                 },
@@ -233,6 +236,21 @@ TASKS: list[Task] = [
         },
         acceptance=[{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
     ),
+    Task(
+        key="long_rename_chain",
+        goal="把 ledger.core.total 改名为 compute_total，更新全部 5 个调用点；兼容别名只放在 ledger/__init__.py",
+        initial={'ledger/__init__.py': '', 'ledger/core.py': 'def total(items):\n    return sum(items)\n', 'ledger/cart.py': 'from ledger.core import total\n\n\ndef cart_total(items):\n    return total(items)\n', 'ledger/checkout.py': 'from ledger.core import total\n\n\ndef checkout(items, pct):\n    return total(items) * (100 - pct) / 100\n', 'ledger/report.py': 'from ledger.core import total\n\n\ndef summary(items):\n    return f"total={total(items)}"\n', 'ledger/admin.py': 'from ledger.core import total\n\n\ndef audit(items):\n    return total(items) > 0\n', 'ledger/export.py': 'from ledger.core import total\n\n\ndef as_row(items):\n    return [str(total(items))]\n', 'tests/__init__.py': '', 'tests/test_core.py': 'import unittest\nfrom ledger import total\n\n\nclass T(unittest.TestCase):\n    def test_total(self):\n        self.assertEqual(total([1, 2]), 3)\n', 'tests/test_checkout.py': 'import unittest\nfrom ledger.checkout import checkout\n\n\nclass T(unittest.TestCase):\n    def test_checkout(self):\n        self.assertEqual(checkout([100, 200], 10), 270)\n', 'tests/test_report.py': "import unittest\nfrom ledger.export import as_row\n\n\nclass T(unittest.TestCase):\n    def test_export(self):\n        self.assertEqual(as_row([5]), ['5'])\n", 'tests/test_admin.py': 'import unittest\nfrom ledger.admin import audit\n\n\nclass T(unittest.TestCase):\n    def test_audit(self):\n        self.assertTrue(audit([5]))\n'},
+        correct={'ledger/cart.py': 'from ledger.core import compute_total\n\n\ndef cart_total(items):\n    return compute_total(items)\n', 'ledger/checkout.py': 'from ledger.core import compute_total\n\n\ndef checkout(items, pct):\n    return compute_total(items) * (100 - pct) / 100\n', 'ledger/report.py': 'from ledger.core import compute_total\n\n\ndef summary(items):\n    return f"total={compute_total(items)}"\n', 'ledger/admin.py': 'from ledger.core import compute_total\n\n\ndef audit(items):\n    return compute_total(items) > 0\n', 'ledger/export.py': 'from ledger.core import compute_total\n\n\ndef as_row(items):\n    return [str(compute_total(items))]\n', 'ledger/core.py': 'def compute_total(items):\n    return sum(items)\n', 'ledger/__init__.py': 'from ledger.core import compute_total\n\ntotal = compute_total  # deprecated alias\n'},
+        wrong={'ledger/cart.py': 'from ledger.core import compute_total\n\n\ndef cart_total(items):\n    return compute_total(items)\n', 'ledger/checkout.py': 'from ledger.core import compute_total\n\n\ndef checkout(items, pct):\n    return compute_total(items) * (100 - pct) / 100\n', 'ledger/report.py': 'from ledger.core import compute_total\n\n\ndef summary(items):\n    return f"total={compute_total(items)}"\n', 'ledger/admin.py': 'from ledger.core import total\n\n\ndef audit(items):\n    return total(items) > 0\n', 'ledger/export.py': 'from ledger.core import compute_total\n\n\ndef as_row(items):\n    return [str(compute_total(items))]\n', 'ledger/core.py': 'def compute_total(items):\n    return sum(items)\n', 'ledger/__init__.py': 'from ledger.core import compute_total\n\ntotal = compute_total  # deprecated alias\n'},
+        acceptance=[{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}],
+        plan=[
+            {"id": "T1", "goal": "改名 core 并把别名放进 ledger/__init__.py", "est_cost": 0.3,
+             "acceptance": [{"id": "A1", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}]},
+            {"id": "T2", "deps": ["T1"], "goal": "更新全部 5 个调用点，让全量测试通过",
+             "est_cost": 0.6,
+             "acceptance": [{"id": "A2", "kind": "command", "spec": FULL_SUITE, "must": "exit=0"}]},
+        ],
+    ),
 ]
 
 
@@ -324,7 +342,7 @@ def _make(task: Task, p_correct: float, rng: random.Random):
     return AttemptModel(task, p_correct=p_correct, rng=rng)
 
 
-def _act(task: Task, root: Path, model, *, max_steps: int = 6) -> int:
+def _act(task: Task, root: Path, model, *, max_steps: int = 12) -> int:
     """The B0 primitive: act until the model says finish. No verification."""
     tools = Tools(root)
     tokens = 0
