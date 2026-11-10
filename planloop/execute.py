@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from planloop.blackboard import Blackboard
@@ -77,6 +78,7 @@ class Executor:
         run_id: str = "",
         sandbox=None,
         router=None,
+        context_files=(),
     ):
         self.workspace = workspace
         self.model = model
@@ -92,6 +94,7 @@ class Executor:
 
         self.router = router if router is not None else ModelRouter.single(model)
         self._tier_by_node: dict[str, str] = {}
+        self.context_files = list(context_files)
         self.tools = Tools(
             workspace, ledger=ledger, phase="execute",
             policy=policy, approvals=approvals, run_id=run_id, sandbox=sandbox,
@@ -122,6 +125,28 @@ class Executor:
             return "", []
         return "\n\n".join(sections) + "\n", lesson_ids
 
+    def _files_block(self, *, limit: int = 8000) -> str:
+        """Current contents of the files the task declared as context.
+
+        Read every step on purpose: a file the node just wrote must not appear
+        stale on the next turn.
+        """
+        chunks: list[str] = []
+        used = 0
+        for rel in self.context_files:
+            target = (self.workspace / rel) if not Path(rel).is_absolute() else Path(rel)
+            try:
+                text = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if used + len(text) > limit:
+                text = text[: max(0, limit - used)] + "\n... [truncated]"
+            used += len(text)
+            chunks.append(f"--- {rel} ---\n{text}")
+            if used >= limit:
+                break
+        return "\n".join(chunks)
+
     def _prompt(self, node: TaskNode, plan: Plan, extra: str, memory_block: str) -> str:
         context = self.bb.context_for(
             node_id=node.id,
@@ -132,6 +157,9 @@ class Executor:
             acceptance=node.acceptance_text(),
             compressor=self.compressor,
         )
+        files = self._files_block()
+        if files:
+            context = context + "\n\n# Relevant files (current contents)\n" + files
         return ACT_PROMPT.format(context=context, memory_block=memory_block, extra=extra or "")
 
     def _l1(self, node: TaskNode, evidence: str) -> VerificationReport | None:

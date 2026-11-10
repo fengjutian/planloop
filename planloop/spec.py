@@ -219,6 +219,8 @@ class ProblemSpec:
     limits: Limits = field(default_factory=Limits)
     unknowns: list[Unknown] = field(default_factory=list)
     context: str = ""
+    #: files whose current contents should be injected into every node prompt
+    context_files: list[str] = field(default_factory=list)
     #: optional canned plan (used by offline demos and regression fixtures)
     plan_template: dict[str, Any] | None = None
 
@@ -251,6 +253,7 @@ class ProblemSpec:
             limits=Limits.from_dict(raw.get("limits")),
             unknowns=unknowns,
             context=str(raw.get("context") or ""),
+            context_files=[str(p) for p in raw.get("context_files") or []],
             plan_template=raw.get("plan_template"),
         )
 
@@ -275,6 +278,8 @@ class ProblemSpec:
             out["unknowns"] = [u.to_dict() for u in self.unknowns]
         if self.context:
             out["context"] = self.context
+        if self.context_files:
+            out["context_files"] = list(self.context_files)
         if self.plan_template is not None:
             out["plan_template"] = self.plan_template
         return out

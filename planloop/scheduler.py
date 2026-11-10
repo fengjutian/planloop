@@ -442,6 +442,7 @@ def run(
         run_id=result.run_id,
         sandbox=sandbox,
         router=router,
+        context_files=spec.context_files,
     )
     policy = ReplanPolicy(
         max_attempts=spec.limits.max_attempts_per_node,

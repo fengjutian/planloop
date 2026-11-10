@@ -66,6 +66,7 @@ class Task:
                 "success_criteria": [
                     {"id": "SC1", "kind": "command", "spec": self.oracle, "must": "exit=0"}
                 ],
+                "context_files": sorted(self.initial),
                 "limits": {"max_attempts_per_node": 2, "max_steps_per_node": 4},
                 "plan_template": {
                     "nodes": [
@@ -396,7 +397,17 @@ def benchmark(*, reps: int = 5, p_correct: float = 0.6, seed: int = 0,
     report = Report(reps=reps, p_correct=p_correct, seed=seed)
     for _ in range(reps):
         for task in tasks or TASKS:
-            report.outcomes.append(run_b0(task, p_correct=p_correct, rng=rng))
-            report.outcomes.append(run_b1(task, p_correct=p_correct, rng=rng, n=n_best))
-            report.outcomes.append(run_b2(task, p_correct=p_correct, rng=rng))
+            for runner in (
+                lambda: run_b0(task, p_correct=p_correct, rng=rng),
+                lambda: run_b1(task, p_correct=p_correct, rng=rng, n=n_best),
+                lambda: run_b2(task, p_correct=p_correct, rng=rng),
+            ):
+                outcome = runner()
+                report.outcomes.append(outcome)
+                print(
+                    f"[{outcome.config}] {outcome.task}: success={outcome.success} "
+                    f"tokens={outcome.tokens} {outcome.seconds:.0f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return report

@@ -37,6 +37,41 @@ class BenchTest(unittest.TestCase):
         outcome = run_b2(task, p_correct=1.0, rng=random.Random(0))
         self.assertTrue(outcome.success)
 
+    def test_context_files_are_injected_into_the_executor_prompt(self):
+        import json as _json
+
+        from planloop.model import ScriptedModel
+        from planloop.scheduler import run
+        from planloop.spec import ProblemSpec
+
+        seen: list[str] = []
+
+        def handler(prompt: str) -> str:
+            seen.append(prompt)
+            return _json.dumps({"action": "finish", "summary": "looked"})
+
+        spec = ProblemSpec.from_dict(
+            {
+                "goal": "inspect files",
+                "context_files": ["notes.txt"],
+                "success_criteria": [{"id": "S1", "kind": "file_exists", "spec": "notes.txt"}],
+                "limits": {"max_steps_per_node": 1, "max_attempts_per_node": 1},
+                "plan_template": {"nodes": [{"id": "T1", "goal": "look", "acceptance": [
+                    {"id": "A1", "kind": "file_exists", "spec": "notes.txt"}]}]},
+            }
+        )
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "notes.txt").write_text("MARKER-42")
+            run(spec, model=ScriptedModel(handler), workspace=ws)
+
+        self.assertTrue(seen)
+        self.assertIn("MARKER-42", seen[0])
+        self.assertIn("# Relevant files", seen[0])
+
     def test_report_contains_the_caveat_and_a_table(self):
         report = benchmark(reps=1, p_correct=0.5, seed=0, tasks=[TASKS[0]])
         text = report.to_markdown()

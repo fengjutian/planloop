@@ -4,7 +4,7 @@
 
 ```bash
 python -m planloop demo      # 四组对照实验，约 20 秒
-python -m unittest discover -s tests -t .   # 141 项测试
+python -m unittest discover -s tests -t .   # 142 项测试
 ```
 
 核心主张只有一句：**长任务失败的主因不是规划器不够聪明，而是计划不可验证、状态不可持久、预算不受控。** 所以这个项目把力气花在"验收、记忆、回滚"上，而不是提示词。
