@@ -1,0 +1,67 @@
+{
+  "goal": "让 shop 包的折扣计算正确：total([100, 200], 10) == 270",
+  "context": "这是一个最小示例：仓库里只有一个失败的单元测试，验收就是让它变绿。\n没有配置模型时，用 plan_template 走离线路径。",
+  "success_criteria": [
+    {
+      "id": "SC1",
+      "kind": "command",
+      "spec": "python -m unittest discover -s tests -q",
+      "must": "exit=0"
+    },
+    {
+      "id": "SC2",
+      "kind": "file_contains",
+      "spec": "shop/pricing.py",
+      "must": "def total"
+    }
+  ],
+  "constraints": [
+    "不要修改 tests/ 下的文件",
+    "不要引入第三方依赖"
+  ],
+  "budget": {
+    "tokens": 120000,
+    "tool_calls": 80,
+    "wall_clock_s": 900
+  },
+  "limits": {
+    "max_depth": 4,
+    "max_fanout": 7,
+    "max_steps_per_node": 10,
+    "max_attempts_per_node": 2
+  },
+  "unknowns": [
+    {
+      "id": "U1",
+      "question": "折扣是百分比还是绝对值？",
+      "resolve_by": "ask",
+      "blocking": false,
+      "resolved": true,
+      "answer": "百分比：total([100,200],10) == 270"
+    }
+  ],
+  "plan_template": {
+    "nodes": [
+      {
+        "id": "T1",
+        "goal": "修复 shop/pricing.py 的 total()，让单元测试通过",
+        "deps": [],
+        "inputs": {},
+        "outputs": {
+          "files": "shop/pricing.py"
+        },
+        "acceptance": [
+          {
+            "id": "A1",
+            "kind": "command",
+            "spec": "python -m unittest discover -s tests -q",
+            "must": "exit=0"
+          }
+        ],
+        "est_cost": 0.8,
+        "risk": "low",
+        "reversible": true
+      }
+    ]
+  }
+}

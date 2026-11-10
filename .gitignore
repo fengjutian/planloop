@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# runtime artefacts
+.planloop/runs/
+.planloop/events/
+# memory: public.db is shareable and committed, private.db never leaves the machine
+.planloop/memory/private.db
+.planloop/memory/*.db-journal
+.planloop/memory/*.db-wal
+.planloop/memory/*.db-shm
+demo-run/
+.demo/
+.dbg/
+*.log
+
+# local credentials (never commit)
+.planloop/credentials.env
+.planloop/*.env
