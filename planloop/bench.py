@@ -309,9 +309,15 @@ def run_b0(task: Task, *, p_correct: float, rng: random.Random) -> Outcome:
 
 
 def run_b1(task: Task, *, p_correct: float, rng: random.Random, n: int = 3) -> Outcome:
-    """N attempts, keep the most common artefact set. Still no verification."""
+    """N attempts, keep the most common artefact set. Still no verification.
+
+    The winner is judged by the **oracle**, not by string equality with the
+    reference solution: a real model may fix the bug in a different but equally
+    valid way, and scoring that as a failure would be wrong.
+    """
     started = time.monotonic()
     votes: dict[str, int] = {}
+    artefacts: dict[str, dict[str, str]] = {}
     tokens = 0
     for _ in range(n):
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,14 +325,25 @@ def run_b1(task: Task, *, p_correct: float, rng: random.Random, n: int = 3) -> O
             task.build(root)
             model = _make(task, p_correct, rng)
             tokens += _act(task, root, model)
-            fingerprint = "\n".join(
-                f"{p}:{(root / p).read_text(encoding='utf-8')}"
-                for p in sorted(task.correct) if (root / p).exists()
-            )
+            files = {
+                p: (root / p).read_text(encoding="utf-8")
+                for p in sorted(task.correct)
+                if (root / p).exists()
+            }
+            fingerprint = "\n".join(f"{p}:{files[p]}" for p in sorted(files))
             votes[fingerprint] = votes.get(fingerprint, 0) + 1
+            artefacts[fingerprint] = files
     winner = max(votes.items(), key=lambda kv: kv[1])[0]
-    correct = "\n".join(f"{p}:{task.correct[p]}" for p in sorted(task.correct))
-    return Outcome("B1", task.key, winner == correct, tokens, n, time.monotonic() - started)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        task.build(root)
+        for path, content in artefacts[winner].items():
+            target = root / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        success = task.passes(root)
+    return Outcome("B1", task.key, success, tokens, n, time.monotonic() - started)
 
 
 def run_b2(task: Task, *, p_correct: float, rng: random.Random) -> Outcome:
