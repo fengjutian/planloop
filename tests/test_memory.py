@@ -138,6 +138,111 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(len(miss), 0)
 
 
+class LessonRetryTest(unittest.TestCase):
+    """A lesson must not degrade to the fallback template because the model
+    thought out loud.
+
+    2026-11-11: on a real reasoning model the lesson call sometimes came back
+    with **no content** -- the client fell back to the reasoning channel, so
+    the reply was prose ("We need answer JSON only. Need infer lesson...")
+    with no ``{`` in it.  The JSON parser rejected it and the lesson silently
+    became the fallback template: no advice, no trigger, no guard.  The fix is
+    one strict retry; the point of this test is that the retry actually
+    recovers, and that the failure is still recorded.
+    """
+
+    def test_a_prose_first_reply_is_retried_and_the_lesson_survives(self):
+        calls = {"n": 0}
+
+        def handler(prompt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "We need answer JSON only. Need infer lesson."
+            return json.dumps(
+                {
+                    "summary": "the tier table was applied with the wrong fee",
+                    "cause": "the fee depends on the tier",
+                    "fix": "use pct() for every discount",
+                    "trigger": {"files": ["shop/*.py"]},
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _ws(tmp)
+            model = ScriptedModel(handler, name="scripted")
+            lesson = propose_lesson(
+                model,
+                node_goal="g",
+                failure_text=IMPORT_ERROR,
+                fix_text="wrote shop/helpers.py",
+                workspace=ws,
+            )
+        assert lesson is not None
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(lesson.source, "model")
+        self.assertIn("tier table", lesson.summary)
+        self.assertEqual(lesson.trigger.files, ["shop/*.py"])
+        self.assertTrue(
+            any("second attempt" in e for e in lesson.evidence),
+            f"the first failure was not recorded: {lesson.evidence}",
+        )
+
+    def test_two_prose_replies_fall_back_and_say_so(self):
+        def handler(prompt):
+            return "still thinking, no json here"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = _ws(tmp)
+            model = ScriptedModel(handler, name="scripted")
+            lesson = propose_lesson(
+                model,
+                node_goal="g",
+                failure_text=IMPORT_ERROR,
+                fix_text="wrote shop/helpers.py",
+                workspace=ws,
+            )
+        assert lesson is not None
+        self.assertEqual(lesson.source, "heuristic")
+        self.assertTrue(
+            any("lesson model unusable" in e for e in lesson.evidence),
+            f"the failure was swallowed: {lesson.evidence}",
+        )
+
+
+class FixExcerptTest(unittest.TestCase):
+    """The lesson proposer must see **what the fix looks like**.
+
+    2026-11-11: the proposer used to get "wrote 239 chars to
+    shop/helpers.py" and the model's own one-line summary.  With nothing but
+    that it **invented** the cause and the fix -- a lesson claimed the fix
+    was ``1 - p/100`` for every tier while the file it had just written
+    contained the tier table.  Such a lesson is injected into the next task
+    with a matching trigger, so a wrong one is worse than none.
+    """
+
+    def test_the_written_file_content_is_shown(self):
+        from planloop.scheduler import _fix_excerpt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp)
+            (ws / "shop").mkdir()
+            (ws / "shop" / "helpers.py").write_text(
+                "def pct(value):\n    fee = 0.05 if value >= 20 else 0.02\n",
+                encoding="utf-8",
+            )
+            text = _fix_excerpt(ws, ["shop/helpers.py"])
+        self.assertIn("def pct(value):", text)
+        self.assertIn("0.05 if value >= 20", text)
+        self.assertIn("after the fix", text)
+
+    def test_no_files_means_no_excerpt(self):
+        from planloop.scheduler import _fix_excerpt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(_fix_excerpt(Path(tmp), []), "")
+            self.assertEqual(_fix_excerpt(Path(tmp), ["missing.py"]), "")
+
+
 class GuardValidationTest(unittest.TestCase):
     """A lesson may only carry a guard that already passes in the workspace."""
 

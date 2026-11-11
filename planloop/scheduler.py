@@ -122,6 +122,38 @@ class RunResult:
         return "\n".join(lines)
 
 
+def _fix_excerpt(workspace: Path, files: list[str], limit: int = 2400) -> str:
+    """Show what the files look like **now**, so the lesson can be true.
+
+    The lesson proposer used to get a summary of the fix -- "wrote 239 chars
+    to shop/helpers.py" plus the model's own one-line summary.  With nothing
+    but that, the model **invents** the cause and the fix: measured on
+    MiniMax-M3.1-Flash, a lesson claimed the fix was ``1 - p/100`` for every
+    tier while the file it had just written contained the tier table.  A
+    lesson like that is worse than no lesson -- it is injected with a
+    matching trigger.
+    """
+    if not files:
+        return ""
+    parts: list[str] = []
+    used = 0
+    for rel in list(files)[:3]:
+        target = (workspace / rel) if not Path(rel).is_absolute() else Path(rel)
+        try:
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if used + len(text) > limit:
+            text = text[: max(0, limit - used)]
+        used += len(text)
+        parts.append(f"--- {rel} (after the fix) ---\n{text}")
+        if used >= limit:
+            break
+    if not parts:
+        return ""
+    return "\n" + "\n".join(parts)
+
+
 def _account_guards(memory, node, outcome, bb) -> None:
     """Credit or debit each injected guard after the node finishes.
 
@@ -564,7 +596,8 @@ def run(
                             node_goal=node.goal,
                             failure_text=first["text"],
                             fix_text="commands: " + " ; ".join(outcome.commands[-4:])
-                            + "\nsummary: " + outcome.summary,
+                            + "\nsummary: " + outcome.summary
+                            + _fix_excerpt(workspace, outcome.files),
                             workspace=workspace,
                             ledger=ledger,
                             verifier=verifier,

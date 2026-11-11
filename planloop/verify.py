@@ -171,8 +171,17 @@ class Verifier:
                 )
             combined = obs.stdout + "\n" + obs.stderr
             wants = parse_must(crit.must or "exit=0")
+            notes: list[str] = []
+            if not wants:
+                # A `must` the parser does not understand must not turn into a
+                # criterion that always passes.  Measured: a model-proposed
+                # guard with ``must="exit status 0 with all tests passing"``
+                # has no ``key=value`` pair at all, so the criterion parsed to
+                # nothing and *always* passed -- a guard that can never catch
+                # anything.  Fall back to the default for commands.
+                wants = {"exit": ("=", "0")}
+                notes.append(f"unparsable must {crit.must!r}; using exit=0")
             ok = True
-            notes = []
             for key, (op, val) in wants.items():
                 if key == "exit":
                     good = obs.exit_code == int(val)

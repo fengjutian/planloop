@@ -27,9 +27,26 @@ class BenchTest(unittest.TestCase):
         task = TASKS[0]
         zero = run_b0(task, p_correct=1.0, rng=random.Random(1))
         five = run_b1(task, p_correct=1.0, rng=random.Random(1), n=5)
-        self.assertEqual(zero.attempts, 1)
+        # B1 runs n independent attempts; B0 runs a single episode, so its
+        # counter holds the model calls inside that episode (see Outcome.attempts).
         self.assertEqual(five.attempts, 5)
+        self.assertGreaterEqual(zero.attempts, 1)
         self.assertGreater(five.tokens, zero.tokens)
+
+    def test_b1_vote_does_not_corrupt_a_perfect_model(self):
+        """The vote must not be able to turn a right answer into a wrong one.
+
+        B1 keeps the most common artefact set out of n attempts.  If the
+        voting were biased, it would show up here: a model that is always
+        right must always win, and a model that is always wrong must never
+        win -- otherwise the blind-vote baseline would be mismeasured.
+        """
+        task = [t for t in TASKS if t.key == "divide_zero_hidden"][0]
+        for seed in (0, 1, 2):
+            good = run_b1(task, p_correct=1.0, rng=random.Random(seed), n=3)
+            bad = run_b1(task, p_correct=0.0, rng=random.Random(seed), n=3)
+            self.assertTrue(good.success, f"seed={seed}: a perfect model must win the vote")
+            self.assertFalse(bad.success, f"seed={seed}: a broken model must not win the vote")
 
     def test_b2_recovers_a_failed_first_attempt(self):
         task = TASKS[0]

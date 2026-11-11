@@ -372,8 +372,8 @@ def _cmd_bench(args: argparse.Namespace) -> int:
         if not key:
             print("no API key: set PLANLOOP_API_KEY or .planloop/credentials.env", file=sys.stderr)
             return 2
-        bench.MODEL_FACTORY = bench.real_model_factory(model, base, key)
-        print(f"using real model {model} @ {base}")
+        bench.MODEL_FACTORY = bench.real_model_factory(model, base, key, temperature=args.temperature)
+        print(f"using real model {model} @ {base} (temperature={args.temperature})")
 
     tasks = [t for t in bench.TASKS if not args.tasks or t.key in args.tasks.split(",")]
     if not tasks:
@@ -383,8 +383,127 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     report = bench.benchmark(
         reps=args.reps, p_correct=args.p_correct, seed=args.seed, tasks=tasks,
         n_best=args.n_best, configs=tuple(c.strip().upper() for c in args.configs.split(",") if c.strip()),
+        temperature=args.temperature,
     )
     text = report.to_markdown()
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_faults(args: argparse.Namespace) -> int:
+    """Measure how much of a known defect set the acceptance criterion catches."""
+    from planloop.faults import run_suite, suite_for_keys
+
+    cases = None
+    if args.cases:
+        cases = suite_for_keys([c.strip() for c in args.cases.split(",") if c.strip()])
+        if not cases:
+            print(f"no fault cases matched {args.cases!r}", file=sys.stderr)
+            return 2
+    report = run_suite(cases)
+    text = report.to_markdown()
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_diagnose(args: argparse.Namespace) -> int:
+    """Attribute the success numbers to a limiting factor, from finished runs."""
+    from planloop.diagnose import diagnose, parse_since
+
+    demo = Path(args.demo)
+    if not demo.is_dir():
+        print(f"no such directory: {demo}", file=sys.stderr)
+        return 2
+    events = Path(args.events) if args.events else None
+    text = diagnose(demo, events, since=parse_since(args.since))
+    if args.out:
+        Path(args.out).write_text(text, encoding="utf-8")
+        print(f"wrote {args.out}")
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_membench(args: argparse.Namespace) -> int:
+    """Measure what the memory system actually buys on the second task."""
+    from planloop.membench import (
+        CONTRACT_FAMILY,
+        DEMO_FAMILY,
+        FEE_FAMILY,
+        REAL_ARMS,
+        SCRIPTED_ARMS,
+        analyze_events,
+        run_membench,
+        to_markdown,
+    )
+
+    families = {"demo": DEMO_FAMILY, "contract": CONTRACT_FAMILY, "fee": FEE_FAMILY}
+    # the demo family does not make a real model fail first, and a lesson only
+    # exists when a task fails and is then fixed -- so the real default is the
+    # contract family, not the demo one
+    family = families.get(args.family or ("contract" if args.real else "demo"), DEMO_FAMILY)
+
+    if args.analyze:
+        # read the behaviour back out of a finished run, without re-running
+        # it: the question "did the memory change what the model did?" is
+        # answered by the event log, not by the summary numbers
+        base = Path(args.dir)
+        logs = sorted(base.glob("events_*.jsonl"))
+        if not logs:
+            print(f"no event logs in {base}", file=sys.stderr)
+            return 2
+        rows = []
+        for log in logs:
+            stats = analyze_events(log, family.hidden_markers)
+            rows.append((log.stem.replace("events_", ""), stats))
+        width = max(len(name) for name, _ in rows)
+        print(f"{'臂/rep'.ljust(width)}  动作  读  跑  写  无效  看了隐藏约定  第一步")
+        for name, stats in rows:
+            print(f"{name.ljust(width)}  {stats.actions:>4}  {stats.reads:>2}  "
+                  f"{stats.runs:>2}  {stats.writes:>2}  {stats.invalid:>4}  "
+                  f"{stats.hidden_looks:>10}  {stats.first_label or '—'}")
+        return 0
+
+    model_for = None
+    arms = SCRIPTED_ARMS
+    mode = "scripted"
+    if args.real:
+        from planloop.model import OpenAICompatModel
+
+        model_name = args.model or os.environ.get("PLANLOOP_MODEL") or "MiniMax-M3.1-Flash"
+        base_url = args.base_url or os.environ.get("PLANLOOP_BASE_URL") or "https://api.minimax.chat/v1"
+        key = os.environ.get("PLANLOOP_API_KEY") or _local_api_key(args.workspace)
+        if not key:
+            print("no API key: set PLANLOOP_API_KEY or .planloop/credentials.env", file=sys.stderr)
+            return 2
+        print(f"using real model {model_name} @ {base_url} (temperature {args.temperature})")
+
+        def model_for(arm):  # noqa: F811 - one mode per run
+            return OpenAICompatModel(
+                model_name, base_url=base_url, api_key=key, temperature=args.temperature
+            )
+
+        arms = REAL_ARMS
+        mode = "real"
+
+    def write_report(result):
+        text = to_markdown(result)
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+
+    result = run_membench(
+        Path(args.dir), reps=args.reps, model_for=model_for, arms=arms, mode=mode,
+        family=family, progress=write_report,
+    )
+    text = to_markdown(result)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
         print(f"wrote {args.out}")
@@ -453,9 +572,39 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--base-url", default="", dest="base_url")
     bench.add_argument("--n-best", type=int, default=3, dest="n_best")
     bench.add_argument("--tasks", default="", help="comma separated task keys")
-    bench.add_argument("--configs", default="B0,B1,B2", help="which configs to run")
+    bench.add_argument("--configs", default="B0,B1,B2",
+                       help="which configs to run: B0=blind, B1=vote, B2=verified, "
+                            "B2C=no acceptance, B2D=quiet acceptance (fails without a reason)")
+    bench.add_argument("--temperature", type=float, default=0.2,
+                       help="sampling temperature of the real model (higher = noisier first shots)")
     bench.add_argument("-w", "--workspace", default=".")
     bench.set_defaults(func=_cmd_bench)
+
+    faults = sub.add_parser("faults", help="criterion recall on a fault-injection suite")
+    faults.add_argument("--out", default="")
+    faults.add_argument("--cases", default="", help="comma separated case keys (default: all)")
+    faults.set_defaults(func=_cmd_faults)
+
+    diag = sub.add_parser("diagnose", help="attribute the success numbers to a limiting factor")
+    diag.add_argument("--demo", default=".demo", help="directory with bench stdout logs")
+    diag.add_argument("--events", default="", help="directory with events_*.jsonl (optional)")
+    diag.add_argument("--since", default="", help="only logs modified at/after this ISO time")
+    diag.add_argument("--out", default="")
+    diag.set_defaults(func=_cmd_diagnose)
+
+    membench = sub.add_parser("membench", help="what does memory buy on the second task?")
+    membench.add_argument("--dir", default=".membench")
+    membench.add_argument("--out", default="")
+    membench.add_argument("--reps", type=int, default=1)
+    membench.add_argument("--real", action="store_true", help="use a real model instead of the scripted one")
+    membench.add_argument("--model", default="")
+    membench.add_argument("--base-url", default="", dest="base_url")
+    membench.add_argument("--temperature", type=float, default=0.2)
+    membench.add_argument("--family", default="", help="demo | contract | fee")
+    membench.add_argument("--analyze", action="store_true",
+                          help="read the behaviour back out of a finished run dir, without running")
+    membench.add_argument("-w", "--workspace", default=".")
+    membench.set_defaults(func=_cmd_membench)
 
     approvals = sub.add_parser("approvals", help="review high-risk actions")
     approvals.add_argument("action", choices=["list", "approve", "deny"])

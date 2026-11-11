@@ -15,6 +15,9 @@ dist/
 .planloop/memory/*.db-shm
 demo-run/
 .demo/
+.membench/
+.membench-*/
+.membench-*_events_summary.json
 .dbg/
 *.log
 

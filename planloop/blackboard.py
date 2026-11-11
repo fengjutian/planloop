@@ -61,6 +61,8 @@ class Blackboard:
         self.dead_ends: list[str] = []
         self.failures: dict[str, list[str]] = {}
         self.observations: dict[str, list[str]] = {}
+        #: the last acceptance failure per node -- pinned, never evicted
+        self.rejections: dict[str, str] = {}
         self.log_path = Path(log_path) if log_path else None
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,24 @@ class Blackboard:
         bucket = self.observations.setdefault(node_id, [])
         bucket.append(text[:2000])
         del bucket[:-6]  # keep the last few only
+
+    def record_rejection(self, node_id: str, text: str) -> None:
+        """Remember the last acceptance failure of a node.
+
+        The prompt shows only the last couple of observations, so a failure
+        can be pushed out of the window by the model's own actions -- and the
+        one thing a model needs while it is failing is *why* it failed.  The
+        rejection is therefore pinned separately and re-shown until the
+        acceptance passes.
+
+        (Measured separately: a 23-read loop was **not** caused by this --
+        the failure was still in the window.  The pin is a guarantee, not the
+        explanation of that loop.)
+        """
+        self.rejections[node_id] = text[:2000]
+
+    def clear_rejection(self, node_id: str) -> None:
+        self.rejections.pop(node_id, None)
 
     def add_fact(self, key: str, value: str) -> None:
         self.facts[key.strip()] = value.strip()

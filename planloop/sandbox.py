@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -50,6 +51,22 @@ KEEP = {
 
 class SandboxError(RuntimeError):
     pass
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill a command and everything it started."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 class Sandbox(Protocol):
@@ -87,21 +104,41 @@ class HostSandbox:
     def run(self, cmd: str, *, cwd: Path, timeout: float | None = None) -> Observation:
         env, removed = scrub_env()
         self._removed.update(removed)
+        limit = timeout or self.timeout
+        kwargs: dict[str, Any] = dict(
+            shell=True,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            encoding="utf-8",
+            errors="replace",
+            # Windows: cmd.exe waits for *more input* when a quote is
+            # unbalanced -- a model that writes `python -c "print(1` hangs the
+            # whole run forever.  Giving stdin EOF ends that wait at once.
+            stdin=subprocess.DEVNULL,
+        )
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                timeout=timeout or self.timeout,
-                env=env,
-                encoding="utf-8",
-                errors="replace",
-            )
-            return Observation("run", proc.returncode == 0, proc.returncode, proc.stdout, proc.stderr)
+            proc = subprocess.Popen(cmd, **kwargs)
+        except OSError as exc:
+            return Observation("run", False, 126, "", f"could not start command: {exc}")
+        try:
+            stdout, stderr = proc.communicate(timeout=limit)
         except subprocess.TimeoutExpired:
-            return Observation("run", False, 124, "", f"timed out after {timeout or self.timeout}s")
+            # Killing the shell is not enough: a grandchild that still holds
+            # the stdout pipe makes ``communicate()`` block forever, so the
+            # timeout would never fire.  Kill the tree, then stop waiting.
+            _kill_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            note = f"timed out after {limit}s"
+            return Observation("run", False, 124, stdout or "", (stderr or "") + f"\n{note}")
+        return Observation("run", proc.returncode == 0, proc.returncode, stdout or "", stderr or "")
 
     @property
     def redacted_variables(self) -> list[str]:

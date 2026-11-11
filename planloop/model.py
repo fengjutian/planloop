@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import re
 import urllib.error
 import urllib.request
@@ -26,6 +27,11 @@ class Completion:
     tokens_in: int = 0
     tokens_out: int = 0
     cached_tokens: int = 0
+    #: True when the provider gave us **only** the reasoning channel: the model
+    #: thought and never answered.  A caller that needs a structured answer
+    #: must treat this as a failure, not as an answer.
+    reasoning_only: bool = False
+    finish_reason: str = ""
 
     @property
     def tokens(self) -> int:
@@ -179,23 +185,43 @@ class OpenAICompatModel:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:  # pragma: no cover - network path
-            raise RuntimeError(f"model HTTP {exc.code}: {exc.read()[:400]!r}") from exc
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read()[:300]
+                last_error = RuntimeError(f"model HTTP {exc.code}: {body!r}")
+                if exc.code < 500 and exc.code != 429:
+                    raise last_error from exc
+            except (urllib.error.URLError, TimeoutError) as exc:
+                last_error = RuntimeError(f"model unreachable: {exc}")
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
+        else:
+            raise last_error or RuntimeError("model call failed")
         usage = data.get("usage") or {}
         cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
+        finish = str(choice.get("finish_reason") or "")
         # reasoning models may return an empty `content` when they hit the token
         # cap while thinking; fall back to the reasoning channel, then to a
         # readable error rather than a KeyError deep inside the harness.
-        text = message.get("content") or message.get("reasoning_content") or ""
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+        text = content or reasoning
+        # The model thought but never answered.  The reasoning text is still
+        # useful to show, but a caller that needs a *structured* answer must
+        # treat this as a failure -- otherwise the prose gets parsed as if it
+        # were the answer, and a one-shot call (the lesson proposer) quietly
+        # degrades to its fallback template.
+        reasoning_only = not content and bool(reasoning)
         if not text:
-            finish = choice.get("finish_reason", "?")
             raise RuntimeError(
-                f"model returned no content (finish_reason={finish}); "
+                f"model returned no content (finish_reason={finish or '?'}); "
                 "raise max_tokens or lower the prompt size"
             )
         return Completion(
@@ -203,6 +229,8 @@ class OpenAICompatModel:
             cached_tokens=cached,
             tokens_in=int(usage.get("prompt_tokens", estimate_tokens(prompt))),
             tokens_out=int(usage.get("completion_tokens", estimate_tokens(text))),
+            reasoning_only=reasoning_only,
+            finish_reason=finish,
         )
 
 

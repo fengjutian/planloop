@@ -43,10 +43,15 @@ The failure (verbatim excerpt):
 {failure}
 ---
 
-What finally made it pass (commands / files written):
+What finally made it pass (commands / files written, and the files as they
+look now):
 ---
 {fix}
 ---
+
+The `fix` field must describe **what is in those files**, not what you guess
+the change was: a lesson that names the wrong change is worse than no
+lesson, because it gets injected into the next task with a matching trigger.
 
 Rules:
 - `summary`: one line, what went wrong.
@@ -55,14 +60,42 @@ Rules:
 - `trigger`: when this lesson applies. Give at least one of `files` (glob),
   `goals` (regex over a future task's goal), `error_patterns` (regex over a
   failure text), `commands` (regex over a command line).
+  **Every section you give must match, so give only the ones you can make
+  general.**  Two traps, both measured:
+  - `error_patterns` and `commands` are matched against text that only exists
+    while a failure is being handled; a trigger that carries them can never
+    fire on a *new* task.  Prefer `files` and `goals`.
+  - a `goals` regex that only matches the goal you can see right now makes the
+    lesson unusable: the next task in the same area is worded differently.
+    Write it for the **area**, not for this sentence -- e.g. `(?i)(pricing|discount|total)`
+    rather than `total\\([^)]*discount_pct[^)]*\\)`.
 - `guard`: a machine-checkable check that would have caught this class of
   mistake, or null. It must be cheap and must pass on the current workspace.
   Shape: {{"kind": "command|file_exists|file_contains|json_has_keys",
            "spec": "...", "must": "..."}}
+  For `command`, `must` must be machine-readable: `exit=0`, `stdout~=ok`,
+  `stdout~="text"`, `contains="text"`.  Prose like "exit status 0" cannot be
+  parsed and makes the guard pass by default.
 - Generalise one level: "run the full test suite after cross-module edits" is
   a better lesson than "create helpers.py".
 
 Reply with one JSON object only.
+"""
+
+#: The budget for the lesson call.  It has to cover the *reasoning* tokens as
+#: well: measured on MiniMax-M3.1-Flash, 500 tokens produced 499 reasoning
+#: tokens and no content at all, so every lesson silently degraded to the
+#: heuristic fallback -- no advice, no trigger, no guard.  The same prompt
+#: with 4000 tokens produced a full lesson in 3667 completion tokens.
+LESSON_MAX_TOKENS = 4096
+
+#: Appended when the first lesson reply was not a JSON object.  The model
+#: usually just needs to be told that the prose was not the answer.
+LESSON_RETRY_SUFFIX = """
+
+Your previous reply was not a JSON object.  Reply with **only** the JSON
+object, starting with { and ending with }.  No prose, no explanation, no
+thinking.
 """
 
 VOLATILE: list[tuple[str, str]] = [
@@ -137,6 +170,45 @@ def family(norm: str) -> str:
     return re.sub(r"\b\d+(?:\.\d+)?\b", "<n>", norm)
 
 
+def _valid_regex(pattern: str) -> bool:
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
+def _as_list(value: Any) -> list[str]:
+    """A list of strings, whether the model wrote a list or a bare string.
+
+    Measured on 2026-11-11: the model returned ``"goals": "(?i)(pricing|discount)"``
+    -- a string.  Iterating it yields **one pattern per character**, so the
+    trigger silently became a wildcard (``'i'`` matches almost any goal).
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple)):
+        return [str(x) for x in value if str(x).strip()]
+    return [str(value)]
+
+
+def _first_match(patterns: list[str], text: str, flags: int = re.I) -> str | None:
+    """The first pattern that matches ``text``.
+
+    A broken pattern must not take the retrieval path down with it: the
+    model writes these, and it writes broken ones.
+    """
+    for pattern in patterns:
+        try:
+            if re.search(pattern, text, flags):
+                return pattern
+        except re.error:
+            continue
+    return None
+
+
 # --------------------------------------------------------------------------
 # data model
 # --------------------------------------------------------------------------
@@ -150,10 +222,39 @@ class Trigger:
     def empty(self) -> bool:
         return not (self.files or self.goals or self.commands or self.error_patterns)
 
+    def sanitized(self) -> "Trigger":
+        """Drop the patterns that are not valid regular expressions.
+
+        The model writes the trigger, and a model writes broken regexes:
+        measured on 2026-11-11 one of them came back as
+        ``(?i)(pricing|discount|total`` -- an unterminated group.  Left in
+        place, ``re.search`` raises and takes the whole retrieval path down
+        with it.
+        """
+        return Trigger(
+            files=list(self.files),
+            goals=[g for g in self.goals if _valid_regex(g)],
+            commands=[c for c in self.commands if _valid_regex(c)],
+            error_patterns=[e for e in self.error_patterns if _valid_regex(e)],
+        )
+
     def matches(self, ctx: "MemoryContext") -> tuple[bool, str]:
-        """Every populated section must match; report why it did."""
+        """Every section the context can supply must match; report why.
+
+        A section the context **cannot** supply must not veto.  The execute
+        path builds its context before the node runs, so it carries the goal
+        and the files but no commands and no error text -- and a section that
+        cannot be checked is unknown, not false.  Treating it as false made
+        every lesson whose trigger carries an error pattern or a command
+        pattern unfireable: measured on 2026-11-11, a real model's lesson
+        never reached a single one of 12 prompts, which silently turned the
+        lesson store into a write-only log.  A trigger whose sections cannot
+        be checked at all still matches nothing.
+        """
         reasons: list[str] = []
+        checked = False
         if self.files:
+            checked = True
             hit = next(
                 (f for f in ctx.files if any(fnmatch.fnmatch(f, g) for g in self.files)),
                 None,
@@ -162,21 +263,27 @@ class Trigger:
                 return False, ""
             reasons.append(f"file:{hit}")
         if self.goals:
-            hit = next((g for g in self.goals if re.search(g, ctx.goal, re.I)), None)
+            checked = True
+            hit = _first_match(self.goals, ctx.goal)
             if hit is None:
                 return False, ""
             reasons.append(f"goal:{hit}")
-        if self.commands:
+        if self.commands and ctx.commands:
+            checked = True
             blob = "\n".join(ctx.commands)
-            hit = next((c for c in self.commands if re.search(c, blob, re.I | re.M)), None)
+            hit = _first_match(self.commands, blob, re.I | re.M)
             if hit is None:
                 return False, ""
             reasons.append(f"cmd:{hit}")
-        if self.error_patterns:
-            hit = next((e for e in self.error_patterns if re.search(e, ctx.error_text, re.I)), None)
+        if self.error_patterns and ctx.error_text:
+            checked = True
+            hit = _first_match(self.error_patterns, ctx.error_text)
             if hit is None:
                 return False, ""
             reasons.append(f"err:{hit}")
+        if not checked:
+            # nothing in this trigger could be checked against this context
+            return False, ""
         return True, ", ".join(reasons)
 
     def to_dict(self) -> dict[str, Any]:
@@ -190,12 +297,14 @@ class Trigger:
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> "Trigger":
         raw = raw or {}
-        return cls(
-            files=[str(x) for x in raw.get("files") or []],
-            goals=[str(x) for x in raw.get("goals") or []],
-            commands=[str(x) for x in raw.get("commands") or []],
-            error_patterns=[str(x) for x in raw.get("error_patterns") or []],
+        trigger = cls(
+            files=_as_list(raw.get("files")),
+            goals=_as_list(raw.get("goals")),
+            commands=_as_list(raw.get("commands")),
+            error_patterns=_as_list(raw.get("error_patterns")),
         )
+        # the model writes these; a broken pattern must not reach the matcher
+        return trigger.sanitized()
 
 
 @dataclass
@@ -204,7 +313,6 @@ class MemoryContext:
     files: list[str] = field(default_factory=list)
     commands: list[str] = field(default_factory=list)
     error_text: str = ""
-
     @classmethod
     def from_workspace(cls, goal: str, root: Path | str, *, commands=(), error_text="") -> "MemoryContext":
         root = Path(root)
@@ -500,6 +608,8 @@ def propose_lesson(
     cause = ""
     fix = "worked around it"
     guard: dict[str, Any] | None = None
+    source = "heuristic"
+    notes: list[str] = []
 
     if model is not None:
         prompt = LESSON_PROMPT.format(
@@ -507,25 +617,55 @@ def propose_lesson(
             failure=salient_line(failure_text)[:800],
             fix=fix_text[:1200],
         )
-        try:
-            comp = model.complete(prompt, max_tokens=500)
-            if ledger is not None:
-                ledger.charge("verify", tokens=comp.tokens, note="lesson")
-            data = extract_json(comp.text)
-            summary = str(data.get("summary") or "").strip()
-            cause = str(data.get("cause") or "").strip()
-            fix = str(data.get("fix") or fix).strip()
-            trigger = Trigger.from_dict(data.get("trigger"))
-            g = data.get("guard")
-            if isinstance(g, dict) and g.get("spec"):
-                guard = {
-                    "kind": str(g.get("kind", "command")),
-                    "spec": str(g["spec"]),
-                    "must": str(g.get("must", "")),
-                }
-        except (ValueError, RuntimeError):
-            summary = summary or f"failure repeated: {norm[:120]}"
-            trigger = Trigger(files=_guess_files(norm), error_patterns=[re.escape(norm[:80])])
+        # A reasoning model sometimes spends the whole budget thinking and
+        # returns **no content**; the client then hands back the reasoning
+        # text, which is prose, not JSON.  Parsed as an answer it fails, and
+        # the lesson silently degrades to the fallback template -- no advice,
+        # no trigger, no guard.  Measured on MiniMax-M3.1-Flash: a reply
+        # starting with "We need answer JSON only. Need infer lesson..." and
+        # no ``{`` anywhere in it.  So: one strict retry.
+        for attempt in range(2):
+            ask = prompt if attempt == 0 else prompt + LESSON_RETRY_SUFFIX
+            try:
+                comp = model.complete(ask, max_tokens=LESSON_MAX_TOKENS)
+                if ledger is not None:
+                    ledger.charge("verify", tokens=comp.tokens, note="lesson")
+                data = extract_json(comp.text)
+                summary = str(data.get("summary") or "").strip()
+                cause = str(data.get("cause") or "").strip()
+                fix = str(data.get("fix") or fix).strip()
+                trigger = Trigger.from_dict(data.get("trigger"))
+                g = data.get("guard")
+                if isinstance(g, dict) and g.get("spec"):
+                    guard = {
+                        "kind": str(g.get("kind", "command")),
+                        "spec": str(g["spec"]),
+                        "must": str(g.get("must", "")),
+                    }
+                if summary:
+                    source = "model"
+                    if attempt:
+                        notes.append(
+                            "the lesson needed a second attempt: the first reply "
+                            "was not a JSON object"
+                        )
+                    break
+                notes.append("the model returned no summary")
+                if attempt:
+                    summary = summary or f"failure repeated: {norm[:120]}"
+                    if trigger.empty():
+                        trigger = Trigger(files=_guess_files(norm),
+                                          error_patterns=[re.escape(norm[:80])])
+            except (ValueError, RuntimeError) as exc:
+                # A reasoning model spends its budget on thinking: measured on
+                # MiniMax-M3.1-Flash, a 500-token budget produced 499 reasoning
+                # tokens and **no content at all**, so the lesson had to be built
+                # without the model.  That used to be swallowed silently and the
+                # lesson was still labelled ``source="model"`` -- a store that
+                # claims the model wrote it when nobody did.
+                notes.append(f"lesson model unusable ({type(exc).__name__}: {exc})")
+                summary = summary or f"failure repeated: {norm[:120]}"
+                trigger = Trigger(files=_guess_files(norm), error_patterns=[re.escape(norm[:80])])
     else:
         summary = f"failure: {norm[:120]}"
         trigger = Trigger(error_patterns=[re.escape(norm[:80])])
@@ -571,8 +711,8 @@ def propose_lesson(
         guard=validated,
         strength=strength,
         trust=trust,
-        evidence=[salient_line(failure_text)[:300], fix_text[:300]],
-        source="model" if model is not None else "heuristic",
+        evidence=[salient_line(failure_text)[:300], fix_text[:300]] + notes,
+        source=source,
     )
     return lesson
 

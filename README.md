@@ -4,10 +4,13 @@
 
 ```bash
 python -m planloop demo      # 四组对照实验，约 20 秒
-python -m unittest discover -s tests -t .   # 142 项测试
+python -m unittest discover -s tests -t .   # 238 项测试
 ```
 
-核心主张只有一句：**长任务失败的主因不是规划器不够聪明，而是计划不可验证、状态不可持久、预算不受控。** 所以这个项目把力气花在"验收、记忆、回滚"上，而不是提示词。
+核心主张只有一句：**在「模型自己宣布完成、但其实不算完成」的那一类失效上，主因不是规划器不够聪明，而是计划不可验证。** 所以这个项目把力气花在"验收、记忆、回滚"上，而不是提示词。
+
+> 这句话的范围是实测出来的，不是设计出来的：四臂消融显示验收 + **带诊断的失败反馈**把这类任务的成功率从 0/6 拉到 6/6（`p=1.08e-3`），而"约定写在文档里"这类失效模型自己就能读懂（12/12 全过），**测不出差别**。
+> 主张层面的判断、既有判断要改哪、优先级怎么重排 → [项目主张分析报告](docs/analysis.md)。
 
 ---
 
@@ -38,7 +41,7 @@ python -m unittest discover -s tests -t .   # 142 项测试
 | **持久记忆** | `memdb.py`、`embed.py` | ✅ | SQLite + FTS5 + 向量，公有/私有分库，证据驱动 |
 | CLI | `cli.py` | ✅ | `demo / validate / run / runs / audit / why / approvals / memory / mem / signature` |
 | **模型分档路由** | `routing.py` | ✅ | cheap/standard/strong/verify，失败升级，加权成本；4 易 + 1 难时省 59% |
-| **对照基准** | `bench.py` | ✅ | B0/B1/B2 同任务同预算，独立 oracle 判定成功 |
+| **对照基准** | `bench.py` | ✅ | B0/B1/B2 同任务同预算，判据在工作区外（模型改不到自己的判卷） |
 | 并行调度 | — | ❌ 未做 | 就绪队列是串行的 |
 
 ---
@@ -80,6 +83,13 @@ python -m planloop run spec.json -w ./repo --git --auto-approve   # 里程碑自
 python -m planloop audit -w ./repo         # 生成 AUDIT.md：进度 / 缺口 / 时间线 / 证据等级
 python -m planloop why src/x.py:42 -w ./repo   # 这一行是哪个节点改的
 python -m planloop bench --reps 10 --seed 7   # B0/B1/B2 对照
+python -m planloop bench --configs B0,B2C,B2D,B2 --reps 3 --tasks divide_zero_hidden  # 四臂消融
+python -m planloop bench --real --model MiniMax-M3.1-Flash --temperature 1.0   # 真实模型 + 采样噪声
+python -m planloop faults --out docs/fault-recall.md   # 判据召回率：注入已知缺陷，看判据抓不抓得住
+python -m planloop membench --out docs/memory-value-scripted.md # 记忆值不值（脚本模型）：第二次同类任务快多少
+python -m planloop membench --real --model MiniMax-M3.1-Flash --reps 8 --out docs/memory-value.md  # 同上，换真实模型
+python -m planloop membench --real --family fee --model MiniMax-M3.1-Flash --reps 8 --out docs/memory-value-fee.md  # 契约不可猜那一族：知识必需时才测得出记忆
+python -m planloop membench --analyze --real --dir .membench-fee8   # 从事件流回读"模型到底做了什么"
 python -m planloop approvals list -w ./repo   # 查看等待批准的高危动作
 python -m planloop run spec.json -w ./repo --sandbox docker  # 无网络一次性容器里执行
 python -m planloop memory list             # 查看已学到的教训
@@ -105,7 +115,7 @@ PLANLOOP_API_KEY=...
 
 ```
 planloop/          运行时（纯标准库，无第三方依赖）
-tests/             41 项单测（unittest，pytest 亦可跑）
+tests/             238 项单测（unittest，pytest 亦可跑）
 docs/              设计文档，已实现与仅设计分开标注
 examples/          可跑的 spec 示例
 ```
@@ -133,6 +143,16 @@ examples/          可跑的 spec 示例
 - [安全闸门](docs/safety.md) — 高危动作截留、一次性批准、fail-closed
 - [审计与回滚](docs/audit-rollback.md) — 证据分级、git 提交点、三种回退粒度（设计）
 - [对照基准](docs/bench.md) — B0/B1/B2 设计与实测（含不能证明什么）
+- [项目主张分析报告](docs/analysis.md) — **验证层是不是壁垒**：判断、对既有判断的修正、重排后的优先级
+- [实验汇总](docs/bench-summary.md) — 全部实验结果：结论、机制证据、效度威胁、下一步
+- [判据召回率](docs/fault-recall.md) — 故障注入集：仓外强判据 33/33，模型自己写的弱判据只有 13/33
+- [记忆值不值](docs/memory-value.md) — 真实模型（`contract` 族）：**"没测到差异"有一半是装置的毛病**——契约猜得出来
+- [记忆值不值（`fee` 族）](docs/memory-value-fee.md) — 契约**不可猜**那一族：知识必需时，记忆到底能省什么
+- [记忆值不值（脚本模型）](docs/memory-value-scripted.md) — 脚本模型版：教训+护栏与已验证事实两条路径**收益重合**
+- [held-out 判据实测](docs/bench-hidden.md) — 模型自己宣布完成时，验收 + 重试把 0% 拉到 100%
+- [消融：验证 vs 执行器](docs/bench-ablation.md) — 关掉强制验收，同一个执行器退回 0/6
+- [四臂消融：反馈通道](docs/bench-ablation2.md) — 告诉它失败不够，失败输出里得带诊断（B2D 0/5 vs B2 6/6）
+- [文档约定类陷阱（未触发）](docs/bench-trap.md) — 约定写在 README 里拦不住会读文档的模型
 - [模型分档路由](docs/routing.md) — 可判定信号、升级税、实测成本对比
 - [执行沙箱](docs/sandbox.md) — 现状、选型（含 CubeSandbox）与本次实现
 - [已知失效模式](docs/limits.md) — 这套东西什么时候会害你

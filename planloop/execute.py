@@ -19,7 +19,7 @@ from planloop.decomp import Plan, TaskNode
 from planloop.memory import MemoryContext, MemoryStore, signature
 from planloop.model import Model, extract_json
 from planloop.spec import Limits
-from planloop.tools import Observation, Tools
+from planloop.tools import Observation, ToolError, Tools
 from planloop.verify import VerificationReport, Verifier
 
 ACT_PROMPT = """task=act
@@ -42,6 +42,13 @@ class NodeOutcome:
     status: str = "failed"  # done | failed
     verification: VerificationReport | None = None
     steps: int = 0
+    #: the step at which the acceptance criteria were first satisfied (0 =
+    #: never).  ``steps`` counts every step the loop ran, including the ones
+    #: a model spends re-verifying work it has already done.
+    steps_to_pass: int = 0
+    #: the tokens charged up to that same step (0 = never).  The tokens
+    #: charged afterwards are the model confirming what it already did.
+    tokens_to_pass: int = 0
     commands: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
     summary: str = ""
@@ -55,6 +62,8 @@ class NodeOutcome:
             "node": self.node_id,
             "status": self.status,
             "steps": self.steps,
+            "steps_to_pass": self.steps_to_pass,
+            "tokens_to_pass": self.tokens_to_pass,
             "summary": self.summary,
             "failures": [{"signature": f["signature"], "text": f["text"][:300]} for f in self.failures],
             "verification": self.verification.to_dict() if self.verification else None,
@@ -182,9 +191,18 @@ class Executor:
 
     def _observations_block(self, node: TaskNode) -> str:
         obs = self.bb.observations.get(node.id, [])[-2:]
-        if not obs:
+        lines = [f"> {o[-400:]}" for o in obs]
+        # the last acceptance failure is pinned: the model's own actions push
+        # the observation window along, and a model that cannot see *why* it
+        # failed has nothing to act on.  (This did not cause the 23-read
+        # loop -- the failure was still in the window there -- it is a
+        # guarantee that it always is.)
+        rejection = self.bb.rejections.get(node.id, "")
+        if rejection and not any(rejection[-200:] in o for o in obs):
+            lines.append(f"> {rejection[-600:]}")
+        if not lines:
             return ""
-        return "# Recent observations\n" + "\n".join(f"> {o[-400:]}" for o in obs) + "\n\n"
+        return "# Recent observations\n" + "\n".join(lines) + "\n\n"
 
     def _l1(self, node: TaskNode, evidence: str) -> VerificationReport | None:
         if not any(c.layer == "L1" for c in node.acceptance):
@@ -240,44 +258,63 @@ class Executor:
 
             kind = str(action.get("action", "")).lower()
             obs: Observation
-            if kind == "run":
-                cmd = str(action.get("cmd", "")).strip()
-                if not cmd:
-                    obs = Observation("run", False, 2, "", "empty command")
-                else:
-                    outcome.commands.append(cmd)
-                    obs = self.tools.run(cmd)
-            elif kind == "write":
-                path = str(action.get("path", "")).strip()
-                obs = self.tools.write(path, str(action.get("content", "")))
-                if obs.ok:
-                    outcome.files.append(path)
-            elif kind == "write_many":
-                files = action.get("files") or {}
-                written, failed = [], []
-                for path, content in files.items():
-                    single = self.tools.write(str(path), str(content))
-                    if single.ok:
-                        written.append(str(path))
-                        outcome.files.append(str(path))
+            #: what the action touched -- the command, the path, the paths.
+            #: The observation only shows the *result*, so without this the
+            #: event log cannot say "the model read the contract file" and a
+            #: benchmark cannot tell "the memory changed the behaviour" from
+            #: "the memory changed nothing".
+            target = ""
+            try:
+                if kind == "run":
+                    cmd = str(action.get("cmd", "")).strip()
+                    target = cmd[:200]
+                    if not cmd:
+                        obs = Observation("run", False, 2, "", "empty command")
                     else:
-                        failed.append(f"{path}: {single.stderr[:80]}")
-                obs = Observation(
-                    "write_many", not failed, 0 if not failed else 2,
-                    f"wrote {len(written)} files",
-                    "; ".join(failed),
-                )
-            elif kind == "read":
-                obs = self.tools.read(str(action.get("path", "")))
-            elif kind == "finish":
-                finish_summary = str(action.get("summary", "")).strip()
-                obs = Observation("finish", True, 0, "finishing; running full acceptance")
-                finished = True
-            else:
-                obs = Observation("noop", False, 2, "", f"unknown action {kind!r}")
+                        outcome.commands.append(cmd)
+                        obs = self.tools.run(cmd)
+                elif kind == "write":
+                    path = str(action.get("path", "")).strip()
+                    target = path[:200]
+                    obs = self.tools.write(path, str(action.get("content", "")))
+                    if obs.ok:
+                        outcome.files.append(path)
+                elif kind == "write_many":
+                    files = action.get("files") or {}
+                    target = ", ".join(sorted(str(p) for p in files))[:200]
+                    written, failed = [], []
+                    for path, content in files.items():
+                        single = self.tools.write(str(path), str(content))
+                        if single.ok:
+                            written.append(str(path))
+                            outcome.files.append(str(path))
+                        else:
+                            failed.append(f"{path}: {single.stderr[:80]}")
+                    obs = Observation(
+                        "write_many", not failed, 0 if not failed else 2,
+                        f"wrote {len(written)} files",
+                        "; ".join(failed),
+                    )
+                elif kind == "read":
+                    path = str(action.get("path", ""))
+                    target = path[:200]
+                    obs = self.tools.read(path)
+                elif kind == "finish":
+                    finish_summary = str(action.get("summary", "")).strip()
+                    obs = Observation("finish", True, 0, "finishing; running full acceptance")
+                    finished = True
+                else:
+                    obs = Observation("noop", False, 2, "", f"unknown action {kind!r}")
+            except ToolError as exc:
+                # A refused action (path outside the workspace, unreadable file)
+                # is ordinary agent behaviour, not a fatal error: report it and
+                # let the model correct itself. Escaping here killed the whole
+                # run -- one stray action could throw away a long task.
+                obs = Observation(kind or "action", False, 2, "", str(exc))
 
             self.bb.record_observation(node.id, obs.render())
-            self.bb.append("action", node.id, action=kind, detail=obs.render()[:600])
+            self.bb.append("action", node.id, action=kind, target=target,
+                           detail=obs.render()[:600])
             observations.append(obs.render())
             outcome.evidence = obs.render()
 
@@ -288,6 +325,9 @@ class Executor:
                     text = (failing.detail + "\n" + failing.evidence).strip() or obs.render()
                     observations.append("acceptance failed:\n" + text)
                     self.bb.record_observation(node.id, text)
+                    # pin it: the model's own actions would otherwise push the
+                    # failure out of the observation window within two steps
+                    self.bb.record_rejection(node.id, "acceptance failed:\n" + text)
                     sig, norm = signature(text)
                     if finished or sig not in seen_signatures:
                         seen_signatures.add(sig)
@@ -309,8 +349,20 @@ class Executor:
                             }
                         )
                         self.bb.record_failure(node.id, f"{sig}: {norm[:160]}")
-                elif report is not None and report.passed and finished:
-                    break
+                elif report is not None and report.passed:
+                    # the work is accepted: the pinned rejection is stale now
+                    self.bb.clear_rejection(node.id)
+                    # The acceptance is satisfied -- this is the first step at
+                    # which the work counts as done.  Recorded separately from
+                    # ``steps`` because the loop keeps running until the model
+                    # announces completion: a real model tends to re-run the
+                    # same suite afterwards, and counting those turns would
+                    # hide how much work the task actually took.
+                    if outcome.steps_to_pass == 0:
+                        outcome.steps_to_pass = step + 1
+                        outcome.tokens_to_pass = int(outcome.tokens)
+                    if finished:
+                        break
 
             if finished:
                 break

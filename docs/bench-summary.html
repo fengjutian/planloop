@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>planloop 实验分析报告</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#f7f5f0; --card:#ffffff; --line:#e9e3d6; --line-soft:#f1ece1;
+    --ink:#14171e; --body:#3a4256; --muted:#7c7a72;
+    --primary:#2f6f5e; --primary-soft:rgba(47,111,94,.08);
+    --warm:#c97b3f; --warm-soft:rgba(201,123,63,.10);
+    --danger:#b06367; --danger-soft:rgba(176,99,103,.10);
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--body);
+    font-family:'Outfit','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;
+    font-size:15px; line-height:1.62;
+  }
+  body::before,body::after{
+    content:""; position:fixed; width:420px; height:420px; pointer-events:none; z-index:0;
+    background:radial-gradient(circle, rgba(47,111,94,.04), transparent 70%);
+  }
+  body::before{top:-200px;right:-140px}
+  body::after{bottom:-220px;left:-160px;background:radial-gradient(circle, rgba(201,123,63,.035), transparent 70%)}
+  main{position:relative; z-index:1; max-width:1040px; margin:0 auto; padding:44px 24px 80px}
+  h1,h2,h3{font-family:'DM Serif Display','Songti SC',serif; font-weight:400; color:var(--ink); margin:0}
+  .eyebrow{
+    font-size:12.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    font-family:'JetBrains Mono',monospace; margin:0 0 14px;
+  }
+  .hero h1{font-size:33px; line-height:1.3; letter-spacing:-.005em; max-width:31ch}
+  .lede{margin:16px 0 0; font-size:16px; color:var(--body); max-width:62ch}
+  .pills{display:flex; flex-wrap:wrap; gap:10px; margin-top:26px}
+  .pill{
+    background:var(--card); border:1px solid var(--line); border-radius:999px;
+    padding:7px 15px; font-size:13.5px; color:var(--body);
+    box-shadow:0 2px 8px rgba(0,0,0,.04);
+  }
+  .pill b{color:var(--ink); font-weight:600}
+  .pill.win{border-color:rgba(47,111,94,.42); background:var(--primary-soft)}
+  .pill.win b{color:var(--primary)}
+  section{margin-top:52px}
+  .s-head{display:flex; align-items:flex-start; gap:11px; margin-bottom:6px}
+  .s-head svg{width:19px;height:19px;color:var(--primary);flex:none;margin-top:5px}
+  h2{font-size:25px; letter-spacing:-.003em}
+  .s-sub{color:var(--muted); font-size:14px; margin:0 0 22px; max-width:70ch}
+  .grid2{display:grid; grid-template-columns:repeat(2,1fr); gap:18px}
+  .card{
+    background:var(--card); border:1px solid var(--line); border-radius:18px; padding:20px 22px;
+    box-shadow:0 4px 16px -2px rgba(0,0,0,.05);
+  }
+  .card h3{font-family:'Outfit',sans-serif; font-weight:600; font-size:15px; color:var(--ink); margin-bottom:4px}
+  .card .cap{color:var(--muted); font-size:12.5px; margin:0 0 14px}
+  .bench{display:grid; grid-template-columns:96px 1fr 78px; gap:12px; align-items:center; padding:5px 0}
+  .bench-label{font-size:13.5px; color:var(--body)}
+  .bench-label b{color:var(--ink); font-weight:600}
+  .bench-track{height:16px; background:var(--line-soft); border-radius:6px; overflow:hidden}
+  .bench-fill{height:100%; border-radius:6px; background:var(--primary)}
+  .bench-fill.zero{background:linear-gradient(90deg,var(--line) 0 100%)}
+  /* parity marker: the 1.0x line on a 0 -> 1.5x scale */
+  .bench-track.parity{position:relative}
+  .bench-track.parity::after{
+    content:""; position:absolute; top:-5px; bottom:-5px; left:66.667%; width:2px;
+    background:var(--muted); opacity:.5; border-radius:2px;
+  }
+  .bench-val{font-family:'JetBrains Mono',monospace; font-size:12.5px; color:var(--ink); text-align:right}
+  table{width:100%; border-collapse:collapse; font-size:14px}
+  th{
+    text-align:left; font-weight:600; color:var(--muted); font-size:12.5px; letter-spacing:.04em;
+    text-transform:uppercase; padding:0 12px 9px 0; border-bottom:1px solid var(--line);
+  }
+  td{padding:10px 12px 10px 0; border-bottom:1px solid var(--line-soft); vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  td b{color:var(--ink); font-weight:600}
+  .yes{color:var(--primary); font-weight:600}
+  .no{color:var(--danger); font-weight:600}
+  .tag{
+    display:inline-block; font-size:11.5px; padding:2px 8px; border-radius:999px;
+    background:var(--line-soft); color:var(--muted); font-family:'JetBrains Mono',monospace;
+  }
+  .tag.ok{background:var(--primary-soft); color:var(--primary)}
+  .tag.no{background:var(--danger-soft); color:var(--danger)}
+  .tag.warn{background:var(--warm-soft); color:var(--warm)}
+  .flow{display:flex; align-items:stretch; gap:0; flex-wrap:wrap}
+  .step{
+    flex:1 1 120px; background:var(--card); border:1px solid var(--line); border-radius:14px;
+    padding:13px 14px; font-size:13px; min-width:0;
+  }
+  .step .k{font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); display:block; margin-bottom:4px}
+  .step .v{color:var(--ink)}
+  .arrow{display:flex; align-items:center; padding:0 9px; color:var(--muted); flex:none}
+  .arrow svg{width:17px;height:17px}
+  .big{display:flex; gap:14px; align-items:baseline}
+  .big .n{font-family:'DM Serif Display',serif; font-size:44px; line-height:1; color:var(--ink)}
+  .big .n.dead{color:var(--danger)}
+  .big .t{font-size:13px; color:var(--muted)}
+  .mono{font-family:'JetBrains Mono',monospace; font-size:12.5px}
+  .chips{display:flex; flex-wrap:wrap; gap:8px}
+  .chip{
+    background:var(--card); border:1px solid var(--line); border-radius:12px; padding:8px 13px;
+    font-size:13px; display:flex; gap:9px; align-items:baseline;
+  }
+  .chip .p{font-family:'JetBrains Mono',monospace; color:var(--primary); font-weight:500}
+  .chip .p.flat{color:var(--muted)}
+  .list{list-style:none; margin:0; padding:0}
+  .list li{
+    display:grid; grid-template-columns:22px 1fr; gap:12px; padding:11px 0;
+    border-bottom:1px solid var(--line-soft); font-size:14px;
+  }
+  .list li:last-child{border-bottom:none}
+  .list .mark{
+    width:20px; height:20px; border-radius:50%; display:grid; place-items:center;
+    background:var(--primary-soft); color:var(--primary); font-size:11px; font-family:'JetBrains Mono',monospace; margin-top:2px;
+  }
+  .list .mark.warn{background:var(--warm-soft); color:var(--warm)}
+  .list b{color:var(--ink); font-weight:600}
+  .list .d{color:var(--muted); font-size:13.5px}
+  pre{
+    background:#14171e; color:#e8e6df; border-radius:14px; padding:16px 18px; overflow-x:auto;
+    font-family:'JetBrains Mono',monospace; font-size:12.5px; line-height:1.85; margin:0;
+  }
+  pre .c{color:#8b918a}
+  .foot{color:var(--muted); font-size:13px; margin-top:40px; padding-top:18px; border-top:1px solid var(--line)}
+  @media (max-width:820px){
+    .grid2{grid-template-columns:1fr}
+    .hero h1{font-size:27px}
+    main{padding:32px 18px 64px}
+    section{margin-top:42px}
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header class="hero">
+  <p class="eyebrow">planloop · 实验分析报告 · 2026-11-11</p>
+  <h1>能证明的不是「验证有用」，而是「失败反馈里的诊断有用」</h1>
+  <p class="lede">
+    全部成功判定由<strong>工作区外的 held-out 判据</strong>给出，不由被测配置自评。
+    收益只在「模型自己宣布完成、但不算完成」这一类失效上出现；执行器的其余部分贡献为 0。
+  </p>
+  <div class="pills">
+    <span class="pill">模型 <b>MiniMax-M3.1-Flash</b></span>
+    <span class="pill">判据 <b>held-out</b>（模型改不到自己的判卷）</span>
+    <span class="pill win">B2 <b>9/9</b> vs B0 <b>0/10</b></span>
+    <span class="pill">Fisher 单侧 <b>p=1.1e-5</b></span>
+    <span class="pill">四臂消融 <b>B2 6/6 vs B2D 0/5</b></span>
+  </div>
+</header>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 3v18h18"/><path d="M7 15l4-5 3 3 5-7"/></svg>
+    <h2>四臂对照：只有「模型被告知了什么」在变</h2>
+  </div>
+  <p class="s-sub">同一批题、同一个判据、同一个成功判定。B0 与 B1 拿不到失败反馈；B2C 有执行器但没有反馈；B2D 被告知失败、也拿到重试，但失败输出里没有诊断。</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>成功率</h3>
+      <p class="cap">带状态记录那次运行（24 格，1 格被策略中断已剔除）</p>
+      <div class="bench"><span class="bench-label"><b>B0</b> 盲</span><div class="bench-track"><div class="bench-fill zero" style="width:0%"></div></div><span class="bench-val">0/6</span></div>
+      <div class="bench"><span class="bench-label"><b>B2C</b> 无验收</span><div class="bench-track"><div class="bench-fill zero" style="width:0%"></div></div><span class="bench-val">0/6</span></div>
+      <div class="bench"><span class="bench-label"><b>B2D</b> 安静判据</span><div class="bench-track"><div class="bench-fill zero" style="width:0%"></div></div><span class="bench-val">0/5</span></div>
+      <div class="bench"><span class="bench-label"><b>B2</b> held-out</span><div class="bench-track"><div class="bench-fill" style="width:100%"></div></div><span class="bench-val">6/6</span></div>
+    </div>
+
+    <div class="card">
+      <h3>平均 tokens</h3>
+      <p class="cap">同样这 24 格</p>
+      <div class="bench"><span class="bench-label"><b>B2C</b></span><div class="bench-track"><div class="bench-fill" style="width:47%"></div></div><span class="bench-val">7121</span></div>
+      <div class="bench"><span class="bench-label"><b>B2</b></span><div class="bench-track"><div class="bench-fill" style="width:60%"></div></div><span class="bench-val">8973</span></div>
+      <div class="bench"><span class="bench-label"><b>B0</b></span><div class="bench-track"><div class="bench-fill" style="width:84%"></div></div><span class="bench-val">12484</span></div>
+      <div class="bench"><span class="bench-label"><b>B2D</b></span><div class="bench-track"><div class="bench-fill" style="width:100%"></div></div><span class="bench-val">14809</span></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <table>
+      <thead><tr><th>臂</th><th>节点验收</th><th>被告知失败</th><th>失败带诊断</th><th>有重试</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td><b>B0</b> 单发盲做</td><td>无</td><td>否</td><td>—</td><td>否</td><td><span class="no">0/6</span></td></tr>
+        <tr><td><b>B1</b> N 次盲投票</td><td>无</td><td>否</td><td>—</td><td>否（只是重来）</td><td><span class="no">0/9</span></td></tr>
+        <tr><td><b>B2C</b> 执行器在、验收关</td><td>永远通过的桩</td><td>否</td><td>—</td><td>否</td><td><span class="no">0/6</span></td></tr>
+        <tr><td><b>B2D</b> 安静判据</td><td>失败但不说原因</td><td class="yes">是</td><td class="no">否</td><td class="yes">是</td><td><span class="no">0/5</span></td></tr>
+        <tr><td><b>B2</b> held-out 判据</td><td>真实判据</td><td class="yes">是</td><td class="yes">是（traceback）</td><td class="yes">是</td><td><span class="yes">6/6</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-6"/><path d="M13 16V8"/><path d="M18 16v-3"/></svg>
+    <h2>显著性</h2>
+  </div>
+  <p class="s-sub">Fisher 精确检验（单侧）。B2 与 B2D 的差异显著，而 B2D 与 B2C 无差别——这正是「诊断有用、重试无用」的统计形状。</p>
+  <div class="chips">
+    <span class="chip"><span class="p">2.2e-3</span><span>B2 6/6 vs B2D 0/5</span></span>
+    <span class="chip"><span class="p">1.1e-3</span><span>B2 6/6 vs B2C 0/6</span></span>
+    <span class="chip"><span class="p">1.1e-3</span><span>B2 6/6 vs B0 0/6</span></span>
+    <span class="chip"><span class="p flat">1.00</span><span>B2D 0/5 vs B2C 0/6</span></span>
+    <span class="chip"><span class="p flat">1.00</span><span>B2D 0/5 vs B0 0/6</span></span>
+    <span class="chip"><span class="p flat">1.00</span><span>B2C 0/6 vs B0 0/6</span></span>
+    <span class="chip"><span class="p">1.1e-5</span><span>B2 9/9 vs B0 0/10</span></span>
+    <span class="chip"><span class="p">2.1e-5</span><span>B2 9/9 vs B1 0/9</span></span>
+  </div>
+  <p class="s-sub" style="margin-top:18px">四臂格局已在两次独立复现中重复出现（0/6、0/6、0/6、6/6）。</p>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 0 0-4 12.7V17h8v-2.3A7 7 0 0 0 12 2z"/><path d="M9 21h6"/></svg>
+    <h2>机制：模型到底看见了什么</h2>
+  </div>
+  <p class="s-sub">成功率说不清 B2D 为什么是 0/5——是「重试没触发」还是「重试了但没诊断」？把模型实际收到的 prompt 抓下来（真模型 spy）就分得清。</p>
+
+  <div class="grid2">
+    <div class="card">
+      <h3>B2（成功）</h3>
+      <p class="cap">两道题各一次，均成功</p>
+      <div class="big">
+        <span class="n">7/8</span>
+        <span class="t">prompt 带真实 traceback</span>
+      </div>
+      <div class="flow" style="margin-top:16px">
+        <div class="step"><span class="k">1</span><span class="v">模型写下实现</span></div>
+        <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></div>
+        <div class="step"><span class="k">2</span><span class="v">验收失败<br><span class="mono" style="color:var(--danger)">ZeroDivisionError</span></span></div>
+        <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></div>
+        <div class="step"><span class="k">3</span><span class="v">traceback 进下一轮 prompt<br>→ 改对</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>B2D（失败）</h3>
+      <p class="cap">mean_empty_hidden，16 次模型调用</p>
+      <div class="big">
+        <span class="n dead">0/16</span>
+        <span class="t">prompt 带 traceback</span>
+      </div>
+      <div class="flow" style="margin-top:16px">
+        <div class="step"><span class="k">1</span><span class="v">模型写下实现</span></div>
+        <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></div>
+        <div class="step"><span class="k">2</span><span class="v">验收失败<br><span class="mono" style="color:var(--muted)">ACCEPTANCE FAILED</span></span></div>
+        <div class="arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/><path d="M13 6l6 6-6 6"/></svg></div>
+        <div class="step"><span class="k">3</span><span class="v">重试了（节点执行 2 次）<br>但不知道错在哪</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:18px">
+    <p style="margin:0; font-size:14.5px">
+      两行读数一次说清三件事：<b style="color:var(--ink)">B2D 的重试确实发生了</b>（节点执行 2 次，第二次带 supervisor 纠正），
+      但模型 16 次调用里一次也没看到过真实报错；<b style="color:var(--ink)">B2 的成功不是「一次就写对」</b>——8 次调用有 7 次带着 traceback，模型是看着报错改对的；
+      而「节点执行 = 1」说明纠错发生在<b style="color:var(--ink)">同一次节点执行内</b>（执行器每步都做 L1 复核，失败输出直接进下一轮 prompt），根本没用上 scheduler 的重试。
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+    <h2>负结果：这些机制对本模型不成立</h2>
+  </div>
+  <p class="s-sub">诚实的负结果和正面结论一样重要：它们不能用来制造失败，只能作为「模型比预期更仔细」的记录。</p>
+  <div class="card">
+    <table>
+      <thead><tr><th>现象</th><th>数据</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>约定写在 <span class="mono">calc/README.md</span></td><td><span class="tag ok">B0 4/4 全过</span></td><td>模型把 README 里的约定读进去了</td></tr>
+        <tr><td>可见测试指向归档副本</td><td><span class="tag ok">B0 4/4 全过</span></td><td>两份拷贝都改了</td></tr>
+        <tr><td>长链改名（3~8 个调用点）</td><td><span class="tag ok">B0 16/16 · B2 16/16</span></td><td>这类失效测不出差别</td></tr>
+        <tr><td>采样噪声（温度 1.0）</td><td><span class="tag ok">B0 12/12 全过</span></td><td>失败不是采样噪声造成的</td></tr>
+        <tr><td>B1 投票逻辑自检</td><td><span class="tag ok">必过 / 必挂</span></td><td>投票不会把对的答案投成错的</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2v20"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+    <h2>成本不是常数</h2>
+  </div>
+  <p class="s-sub">「验证是纯成本」是错的说法。实测三个任务族是三个数，方向甚至相反。</p>
+  <div class="card">
+    <div class="bench"><span class="bench-label">短任务</span><div class="bench-track parity"><div class="bench-fill" style="width:47%"></div></div><span class="bench-val">0.70×</span></div>
+    <div class="bench"><span class="bench-label">长链任务</span><div class="bench-track parity"><div class="bench-fill" style="width:95%; background:var(--warm)"></div></div><span class="bench-val">1.43×</span></div>
+    <div class="bench"><span class="bench-label">hidden 判据</span><div class="bench-track parity"><div class="bench-fill" style="width:39%"></div></div><span class="bench-val">0.59×</span></div>
+    <p style="margin:4px 0 0; font-size:12.5px; color:var(--muted)">
+      刻度 0 → 1.5×，<span class="mono">│</span> 标记处为 1.0×（与 B0 持平）；线左 = 更省，线右 = 更贵。
+    </p>
+    <p style="margin:14px 0 0; font-size:13.5px; color:var(--muted)">
+      模型一次就对 + 任务短 → 更省；模型一次就对 + 任务长链 → 贵 43%（每步重发整个仓库）；
+      模型本来就会错 → 一次失败 + 一次带诊断的重试，比盲写一遍更省。<b style="color:var(--ink)">验证的价值只在该出错的场景里显现。</b>
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <h2>这份报告不证明什么</h2>
+  </div>
+  <p class="s-sub">效度威胁逐条列出来，避免结论被外推。</p>
+  <div class="card">
+    <ul class="list">
+      <li><span class="mark warn">1</span><span><b>任务集窄</b> —— 核心结论只来自 2 道「模型自己宣布完成」的题。roadmap 的验收门是 ≥10 个真实任务。</span></li>
+      <li><span class="mark warn">2</span><span><b>单模型</b> —— 只有 MiniMax-M3.1-Flash，是否跨模型成立未测。</span></li>
+      <li><span class="mark warn">3</span><span><b>样本量小</b> —— 每格 3~5 次；p 值只说明「在这个样本上差异不是偶然」。</span></li>
+      <li><span class="mark warn">4</span><span><b>判据泄漏</b> —— traceback 会把 held-out 测试的函数名露给模型（相当于 TDD 的红灯）。</span></li>
+      <li><span class="mark warn">5</span><span><b>策略会中断运行</b> —— 实测 1/24 的格子因模型写了嵌套 shell 触发确认规则、整轮被拦下；剔除与否会直接改变 B2D 的分母。</span></li>
+      <li><span class="mark warn">6</span><span><b>B2 内部未完全拆开</b> —— 「提前停止」与「每步复核」的贡献尚未单独隔离。</span></li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/><path d="M9 11h2"/></svg>
+    <h2>仪表自身的缺陷</h2>
+  </div>
+  <p class="s-sub">本轮修掉的三个。它们都不会让程序报错，只会悄悄把结论推向有利于假设的方向——比模型出错更危险。</p>
+  <div class="card">
+    <ul class="list">
+      <li><span class="mark">17.1</span><span><b>污染检查是默认值渲染出来的</b> —— 合并脚本里 <span class="mono">contaminated</span> 吃了 dataclass 默认值 <span class="mono">False</span>，于是「24/24 未发现副本」根本没测过。<span class="d">修法：从日志行的 CONTAMINATED 标记读，缺字段报错。</span></span></li>
+      <li><span class="mark">17.2</span><span><b>「重试次数」在真实实验里是占位符</b> —— 取自 <span class="mono">getattr(model,"attempts",1)</span>，真实模型没这个属性，恒为 1；而 B2D 的结论恰恰取决于它。<span class="d">修法：改从 scheduler 的 result.outcomes 取。</span></span></li>
+      <li><span class="mark">17.3</span><span><b>「跑了但失败」与「根本没跑完」算成同一件事</b> —— 被策略中断的格子被算成一次失败，等于凭空给消融假设加了一票。<span class="d">修法：Outcome 增加 status / blocked，按原因分类，中断的格子单列剔除。</span></span></li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>
+    <h2>下一阶段</h2>
+  </div>
+  <p class="s-sub">按 roadmap 的验收门「≥10 个真实任务、每种配置重复运行、成功结论完全由独立 oracle 给出」，还差三件事。</p>
+  <div class="card">
+    <ul class="list">
+      <li><span class="mark warn">1</span><span><b>补任务集（最关键）</b> —— 把 2 道合成题扩到 ≥10 道真实任务，覆盖更多失效形态（跨模块契约、性能、并发、依赖升级…）。每道题都要有 correct / wrong 双向自检：题目本身是坏的，benchmark 会给出与事实相反的结论。<span class="d">修法：双向自检已做成单测，遍历所有带 held-out 判据的题。</span></span></li>
+      <li><span class="mark warn">2</span><span><b>换模型复现</b> —— 至少再加一个模型，检验「诊断有用」是否跨模型成立。</span></li>
+      <li><span class="mark warn">3</span><span><b>补上 B2 内部的剩余混淆</b> —— 单独拆「每步 L1 复核」与「提前停止」，并把 B0 的上下文预算对齐（早期版本 B0 只有 B2 一半）。</span></li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="s-head">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6"/><path d="M12 19h8"/></svg>
+    <h2>复现</h2>
+  </div>
+  <p class="s-sub">全部命令在仓库根目录执行；API key 从 <span class="mono">.planloop/credentials.env</span> 自动读取（不入库）。</p>
+<pre><span class="c"># 全量单测（171 项）</span>
+python -m unittest discover -s tests -t . -q
+
+<span class="c"># held-out 判据对照</span>
+python -m planloop bench --real --model MiniMax-M3.1-Flash --reps 3 \
+    --configs B0,B1,B2 --tasks divide_zero_hidden,mean_empty_hidden
+
+<span class="c"># 四臂消融（带状态记录）</span>
+python -m planloop bench --real --model MiniMax-M3.1-Flash --reps 3 \
+    --configs B0,B2C,B2D,B2 --tasks divide_zero_hidden,mean_empty_hidden
+
+<span class="c"># 采样噪声轴 / 产品本体</span>
+python -m planloop bench --real --model MiniMax-M3.1-Flash --temperature 1.0 --reps 2 --configs B0
+python -m planloop demo --dir .demo</pre>
+</section>
+
+<p class="foot">
+  逐次明细与方法论见仓库 <span class="mono">docs/bench.md</span>；原始报告 <span class="mono">docs/bench-hidden.md</span>、
+  <span class="mono">docs/bench-ablation.md</span>、<span class="mono">docs/bench-ablation2.md</span>、<span class="mono">docs/bench-trap.md</span>、
+  <span class="mono">docs/bench-chain-group.md</span>；本页为汇总视图。
+</p>
+
+</main>
+</body>
+</html>
