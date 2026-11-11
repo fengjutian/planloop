@@ -268,7 +268,8 @@ def _mean_tokens(rows: list[Cell]) -> str:
 
 
 def build_report(cells: list[Cell], used: list[str], skipped: list[str],
-                 events: EventFacts | None = None, *, since: datetime | None = None) -> str:
+                 events: EventFacts | None = None, *, since: datetime | None = None,
+                 events_label: str = "") -> str:
     lines: list[str] = []
     add = lines.append
 
@@ -349,6 +350,8 @@ def build_report(cells: list[Cell], used: list[str], skipped: list[str],
         hid = [cell for cell in rows if cell.hidden]
         add(f"| {config} | {_rate(rows)} | {_rate(hid) if hid else '—'} | {notes.get(config, '')} |")
     add("")
+    add("> \"全部\"列把两类任务混在一起，比例本身没有意义；要看的是它右边两列的差。")
+    add("")
     b2 = [cell for cell in hidden if cell.config == "B2"]
     b2d = [cell for cell in hidden if cell.config == "B2D"]
     b2c = [cell for cell in hidden if cell.config == "B2C"]
@@ -388,7 +391,8 @@ def build_report(cells: list[Cell], used: list[str], skipped: list[str],
     if events is not None and events.failures:
         add("## 六、限制项四：诊断载荷（事件流实测）")
         add("")
-        add(f"- 事件流 {events.files} 份、{events.runs} 次运行、{events.failures} 条失败记录。")
+        add(f"- 事件流 {events.files} 份、{events.runs} 次运行、{events.failures} 条失败记录"
+            + (f"（目录 `{events_label}`）" if events_label else "") + "。")
         add(f"- **{events.with_error}/{events.failures}** 条失败文本带异常类型/断言文本"
             f"（{events.error_share:.0%}），中位长度 **{events.median_length}** 字符。")
         add(f"- 零 token 运行（模型调用直接失败、仓库没被碰过）：**{events.zero_token_runs}** 次；"
@@ -396,10 +400,18 @@ def build_report(cells: list[Cell], used: list[str], skipped: list[str],
         if events.statuses:
             dist = ", ".join(f"{k} ×{v}" for k, v in sorted(events.statuses.items()))
             add(f"- 运行终态：{dist}。")
+            blocked = events.statuses.get("blocked", 0)
+            other = blocked - events.zero_token_runs - events.interrupted
+            if other > 0:
+                add(f"- 其余 `blocked`（**验收/执行失败**，是结果不是装置故障）：**{other}** 次。")
         add("")
         add("读法：这批任务里失败输出**几乎总是等于那条缺失的要求**（异常类型 + 一句消息），")
-        add("所以 100% 能成立；换成\"实现方向错\"或\"多要求只满足一半\"的任务，")
+        add("B2 的 100% 正是靠这一点成立；换成\"实现方向错\"或\"多要求只满足一半\"的任务，")
         add("同样的 traceback 不会把要求告诉模型——**这就是 100% 不可外推的地方**。")
+        if events.zero_token_runs:
+            add("")
+            add(f"> 那 {events.zero_token_runs} 次零 token 运行没有产生失败记录，"
+                "它们不是\"答案错\"，是\"模型没回答\"——两种必须分开统计，否则装置故障会被算成正确性问题。")
         add("")
 
     add("## 七、限制清单")
@@ -413,7 +425,7 @@ def build_report(cells: list[Cell], used: list[str], skipped: list[str],
     add("| 模型能力 | 单模型、可见任务上已接近饱和 | 未测（天花板不在这里） | 可见任务的全过率 |")
     add("| 任务形态 | 每题一条缺失要求、一次修补可完成 | **是**（不可外推的原因） | 任务集只有 2 类隐藏题 |")
     add("| 判据召回 | 已知缺陷分类内 33/33，真实任务未测 | 未知 | [fault-recall.md](fault-recall.md) |")
-    add("| 装置损耗 | 零 token 运行、批准拦截各占几个格子 | 否，但会吃掉有效样本 | 事件流 run_end 统计 |")
+    add("| 装置损耗 | 零 token 运行与批准拦截会吃掉有效格子 | 否，但会缩小有效样本 | §六的运行终态 |")
     add("")
 
     add("## 八、这份诊断不证明什么")
@@ -433,7 +445,8 @@ def build_report(cells: list[Cell], used: list[str], skipped: list[str],
 def diagnose(demo: Path, events: Path | None = None, *, since: datetime | None = None) -> str:
     cells, used, skipped = collect_cells(demo, since=since)
     facts = read_events(events) if events is not None else None
-    return build_report(cells, used, skipped, facts, since=since)
+    return build_report(cells, used, skipped, facts, since=since,
+                        events_label=(events.name if events is not None else ""))
 
 
 def parse_since(text: str) -> datetime | None:

@@ -4,7 +4,7 @@
 
 ```bash
 python -m planloop demo      # 四组对照实验，约 20 秒
-python -m unittest discover -s tests -t .   # 238 项测试
+python -m unittest discover -s tests -t .   # 256 项测试
 ```
 
 核心主张只有一句：**在「模型自己宣布完成、但其实不算完成」的那一类失效上，主因不是规划器不够聪明，而是计划不可验证。** 所以这个项目把力气花在"验收、记忆、回滚"上，而不是提示词。
@@ -86,6 +86,7 @@ python -m planloop bench --reps 10 --seed 7   # B0/B1/B2 对照
 python -m planloop bench --configs B0,B2C,B2D,B2 --reps 3 --tasks divide_zero_hidden  # 四臂消融
 python -m planloop bench --real --model MiniMax-M3.1-Flash --temperature 1.0   # 真实模型 + 采样噪声
 python -m planloop faults --out docs/fault-recall.md   # 判据召回率：注入已知缺陷，看判据抓不抓得住
+python -m planloop diagnose --demo .demo --since 2026-11-10T17:05 --out docs/limit-diagnosis.md  # 成功率被什么限制
 python -m planloop membench --out docs/memory-value-scripted.md # 记忆值不值（脚本模型）：第二次同类任务快多少
 python -m planloop membench --real --model MiniMax-M3.1-Flash --reps 8 --out docs/memory-value.md  # 同上，换真实模型
 python -m planloop membench --real --family fee --model MiniMax-M3.1-Flash --reps 8 --out docs/memory-value-fee.md  # 契约不可猜那一族：知识必需时才测得出记忆
@@ -115,7 +116,7 @@ PLANLOOP_API_KEY=...
 
 ```
 planloop/          运行时（纯标准库，无第三方依赖）
-tests/             238 项单测（unittest，pytest 亦可跑）
+tests/             256 项单测（unittest，pytest 亦可跑）
 docs/              设计文档，已实现与仅设计分开标注
 examples/          可跑的 spec 示例
 ```
@@ -146,6 +147,7 @@ examples/          可跑的 spec 示例
 - [项目主张分析报告](docs/analysis.md) — **验证层是不是壁垒**：判断、对既有判断的修正、重排后的优先级
 - [实验汇总](docs/bench-summary.md) — 全部实验结果：结论、机制证据、效度威胁、下一步
 - [判据召回率](docs/fault-recall.md) — 故障注入集：仓外强判据 33/33，模型自己写的弱判据只有 13/33
+- [成功率被什么限制](docs/limit-diagnosis.md) — 归因诊断：193 个真实格子，限制项是需求可见性与诊断载荷，不是重试上限
 - [记忆值不值](docs/memory-value.md) — 真实模型（`contract` 族）：**"没测到差异"有一半是装置的毛病**——契约猜得出来
 - [记忆值不值（`fee` 族）](docs/memory-value-fee.md) — 契约**不可猜**那一族：知识必需时，记忆到底能省什么
 - [记忆值不值（脚本模型）](docs/memory-value-scripted.md) — 脚本模型版：教训+护栏与已验证事实两条路径**收益重合**
