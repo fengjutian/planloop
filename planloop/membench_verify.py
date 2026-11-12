@@ -519,6 +519,16 @@ def format_report(result: Recomputed) -> str:
             add(f"  => the two arms differ by {floor['steps_delta_pct']} in steps, "
                 f"{floor['tokens_delta_pct']} in tokens, {floor['hidden_delta_pct']} in lookups"
                 " -- that is the model's own variance, so an effect below it is noise")
+    else:
+        # No floor is not the same as a floor of zero.  A run in which every
+        # paired repetition carried a lesson has no repetition where both
+        # arms ran the same prompt -- so it cannot tell an effect apart from
+        # the model's own variance.  Say so, or the effect lines above it get
+        # read as a result.
+        add("")
+        add("NO NOISE FLOOR: this run has no repetition in which both arms ran the "
+            "same prompt, so it cannot tell an effect apart from the model's own "
+            "variance -- an effect size from this run is not reportable.")
     add("")
     if result.mismatches:
         add(f"{len(result.mismatches)} DISAGREEMENT(S) between the report and the event logs:")
