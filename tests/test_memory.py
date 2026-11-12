@@ -78,6 +78,42 @@ class TriggerTest(unittest.TestCase):
         self.assertFalse(trigger.matches(MemoryContext(goal="g", files=["a.py"]))[0])
 
 
+class DoubleStarGlobTest(unittest.TestCase):
+    """A file glob the model wrote must actually be able to match.
+
+    2026-11-11: a real model's lesson carried ``files=['shop/**/*.py']``.
+    ``fnmatch`` has no ``**`` semantics -- it keeps the ``/`` literal -- so
+    that trigger could never match ``shop/helpers.py``.  The lesson was
+    written, stored, and fired **zero** times: the store was a write-only log
+    again, one layer below the regex bug of 19.4.
+    """
+
+    def test_double_star_matches_a_file_directly_under_the_prefix(self):
+        trigger = Trigger(files=["shop/**/*.py"])
+        ctx = MemoryContext(goal="g", files=["shop/helpers.py"])
+        self.assertTrue(trigger.matches(ctx)[0])
+
+    def test_double_star_matches_a_file_in_a_subdirectory(self):
+        trigger = Trigger(files=["shop/**/*.py"])
+        ctx = MemoryContext(goal="g", files=["shop/sub/deep.py"])
+        self.assertTrue(trigger.matches(ctx)[0])
+
+    def test_double_star_does_not_match_a_different_top_level(self):
+        trigger = Trigger(files=["shop/**/*.py"])
+        ctx = MemoryContext(goal="g", files=["tests/test_pricing.py"])
+        self.assertFalse(trigger.matches(ctx)[0])
+
+    def test_single_star_still_matches_directly_under_the_prefix(self):
+        trigger = Trigger(files=["shop/*.py"])
+        ctx = MemoryContext(goal="g", files=["shop/pricing.py"])
+        self.assertTrue(trigger.matches(ctx)[0])
+
+    def test_bare_double_star_matches_anywhere(self):
+        trigger = Trigger(files=["**/*.py"])
+        ctx = MemoryContext(goal="g", files=["a/b/c.py"])
+        self.assertTrue(trigger.matches(ctx)[0])
+
+
 class StoreTest(unittest.TestCase):
     def make_lesson(self, **kw) -> Lesson:
         base = dict(

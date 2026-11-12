@@ -54,6 +54,12 @@ class NodeOutcome:
     summary: str = ""
     evidence: str = ""
     failures: list[dict[str, Any]] = field(default_factory=list)
+    #: how many acceptance failures were **recorded** -- one per distinct
+    #: failure signature, which is exactly how many ``failure`` events the
+    #: event log carries.  ``failures`` above is the same list with its
+    #: details.  The published report quotes this number so that it can be
+    #: re-derived from the raw artifacts.
+    l1_failures: int = 0
     last_error: str = ""
     tokens: float = 0.0
 
@@ -349,6 +355,11 @@ class Executor:
                             }
                         )
                         self.bb.record_failure(node.id, f"{sig}: {norm[:160]}")
+                        # the same number the log records: one failure event
+                        # per distinct signature (a repeated failure is not
+                        # counted twice) -- so a report that quotes it can be
+                        # re-derived from the event log
+                        outcome.l1_failures += 1
                 elif report is not None and report.passed:
                     # the work is accepted: the pinned rejection is stale now
                     self.bb.clear_rejection(node.id)

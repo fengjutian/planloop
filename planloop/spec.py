@@ -17,10 +17,11 @@ CRITERION_KINDS = {
     "json_has_keys",
     "rubric",
     "human",
+    "held_out",
 }
 
 #: criteria that a machine can check without a model in the loop
-DETERMINISTIC_KINDS = {"command", "file_exists", "file_contains", "json_has_keys"}
+DETERMINISTIC_KINDS = {"command", "file_exists", "file_contains", "json_has_keys", "held_out"}
 #: criteria that need an independent model call (layer 2)
 JUDGED_KINDS = {"rubric"}
 #: criteria that need a human (layer 3)
@@ -41,6 +42,15 @@ class Criterion:
 
     ``kind`` selects the checker; ``spec`` is the checker payload and ``must``
     is the expectation (an exit code, a substring, a list of JSON keys...).
+
+    ``kind="held_out"`` is the criterion the **model must not see the
+    implementation of**: its payload lives in ``source`` and is materialised
+    only for the check (:mod:`planloop.heldout`).  ``spec`` is then a
+    **numeric-free description of what the criterion checks** -- the model is
+    told the requirement (it would be told anyway, in the goal), never the
+    answer.  That payload is the answer key, so it is deliberately **not**
+    part of :meth:`to_dict` -- a persisted plan carries the criterion's id
+    but not its source.
     """
 
     id: str
@@ -48,6 +58,8 @@ class Criterion:
     spec: str
     must: str = ""
     weight: float = 1.0
+    #: the payload of a held-out criterion (python source).  Never serialised.
+    source: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Criterion":
@@ -73,6 +85,7 @@ class Criterion:
             spec=spec.strip(),
             must=str(must),
             weight=float(raw.get("weight", 1.0)),
+            source=str(raw.get("source") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +94,9 @@ class Criterion:
             out["must"] = self.must
         if self.weight != 1.0:
             out["weight"] = self.weight
+        # NOTE: ``source`` is intentionally absent.  For a held-out criterion it
+        # is the answer key: writing it into a persisted plan would put the
+        # answer on disk where the model can read it.
         return out
 
     @property
@@ -90,6 +106,11 @@ class Criterion:
         if self.kind in JUDGED_KINDS:
             return "L2"
         return "L3"
+
+    @property
+    def hidden(self) -> bool:
+        """True for a criterion the model is not allowed to see."""
+        return self.kind == "held_out"
 
 
 @dataclass(frozen=True)

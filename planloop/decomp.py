@@ -156,8 +156,23 @@ class TaskNode:
         return out
 
     def acceptance_text(self) -> str:
-        return "\n".join(f"- ({c.layer}/{c.kind}) {c.spec}" + (f" must={c.must}" if c.must else "")
-                         for c in self.acceptance)
+        """The node's acceptance, as the model is allowed to see it.
+
+        A held-out criterion is rendered by its ``spec`` -- a numeric-free
+        description of what it checks.  Its *implementation* is never shown:
+        the payload is the answer key, and a model that knows where the
+        answer lives spends its step budget looking for it (measured on
+        2026-11-11: six of twelve steps went to a fruitless hunt for the
+        criterion).
+
+        (Publishing the requirement up front was tried and reverted: taking it
+        away made the model spin on the file instead of failing and fixing it
+        -- see docs/bench.md 19.13.)
+        """
+        return "\n".join(
+            f"- ({c.layer}/{c.kind}) {c.spec}" + (f" must={c.must}" if c.must else "")
+            for c in self.acceptance if c.spec
+        )
 
     def contracts_text(self) -> str:
         bits = []
@@ -342,7 +357,7 @@ def build_plan(
         raise PlanError("no planner model available and no plan_template supplied")
 
     criteria = "\n".join(f"- {c.id} ({c.kind}): {c.spec}" + (f" must={c.must}" if c.must else "")
-                         for c in spec.success_criteria)
+                         for c in spec.success_criteria if c.spec)
     constraints = "\n".join(f"- {c}" for c in spec.constraints) or "- (none)"
     if probe_notes:
         constraints += "\n- probe findings:\n" + probe_notes

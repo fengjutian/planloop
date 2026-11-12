@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from planloop.heldout import run_held_out
 from planloop.model import Model, extract_json
 from planloop.policy import DeniedAction, NeedsApproval, default_policy
 from planloop.spec import Criterion
@@ -159,6 +160,8 @@ class Verifier:
 
     # -- layers -----------------------------------------------------------
     def _check_l1(self, crit: Criterion) -> Verdict:
+        if crit.hidden:
+            return self._check_held_out(crit)
         if crit.kind == "command":
             try:
                 obs = self._tools.run(crit.spec)
@@ -170,37 +173,7 @@ class Verifier:
                     reason="needs_approval" if needs else "denied_by_policy",
                 )
             combined = obs.stdout + "\n" + obs.stderr
-            wants = parse_must(crit.must or "exit=0")
-            notes: list[str] = []
-            if not wants:
-                # A `must` the parser does not understand must not turn into a
-                # criterion that always passes.  Measured: a model-proposed
-                # guard with ``must="exit status 0 with all tests passing"``
-                # has no ``key=value`` pair at all, so the criterion parsed to
-                # nothing and *always* passed -- a guard that can never catch
-                # anything.  Fall back to the default for commands.
-                wants = {"exit": ("=", "0")}
-                notes.append(f"unparsable must {crit.must!r}; using exit=0")
-            ok = True
-            for key, (op, val) in wants.items():
-                if key == "exit":
-                    good = obs.exit_code == int(val)
-                    notes.append(f"exit={obs.exit_code} (want {val})")
-                elif key in {"stdout", "stderr"}:
-                    hay = obs.stdout if key == "stdout" else obs.stderr
-                    good = bool(re.search(val, hay)) if op == "~=" else (val in hay)
-                    notes.append(f"{key} {op} {val!r}: {good}")
-                elif key == "contains":
-                    good = val in combined
-                    notes.append(f"contains {val!r}: {good}")
-                else:
-                    good = False
-                    notes.append(f"unknown must-key {key}")
-                ok = ok and good
-            return Verdict(
-                crit.id, "L1", ok, "; ".join(notes) or f"exit={obs.exit_code}",
-                evidence=combined[-1500:], reason="" if ok else "command_failed",
-            )
+            return self._command_verdict(crit, obs.exit_code, obs.stdout, obs.stderr)
 
         if crit.kind == "file_exists":
             ok = self._tools.exists(crit.spec)
@@ -231,6 +204,69 @@ class Verifier:
             )
 
         return Verdict(crit.id, "L1", False, f"unsupported L1 kind {crit.kind}", reason="unsupported")
+
+    def _check_held_out(self, crit: Criterion) -> Verdict:
+        """Check a criterion the model is not allowed to see.
+
+        The source is fed to python on stdin, so it **never exists on disk**
+        -- not outside the workspace, not inside it, not for a moment.  The
+        failure text still reaches the model -- it has to, or the model cannot
+        act on it -- but a program that came from stdin has no source line in
+        its traceback, and the failing line is the one that holds the answer.
+        """
+        if not crit.source:
+            # a held-out criterion survives only in the process that created
+            # it: the payload is the answer key, so it is not serialised.
+            return Verdict(
+                crit.id, "L1", False,
+                "held-out criterion has no source in this process",
+                reason="held_out_without_source",
+            )
+        result = run_held_out(crit.source, self.workspace, name=crit.id.lower())
+        verdict = self._command_verdict(crit, result.exit_code, result.stdout, result.stderr)
+        if not verdict.passed and crit.spec:
+            # The failure has to say **what was checked**: a criterion that
+            # only reports "exit=1" leaves the model guessing, and one that
+            # reports a bare Python error ("total() takes 2 positional
+            # arguments but 3 were given") makes it spin in place -- measured:
+            # it re-read the same file sixteen times.
+            verdict.detail = f"checked: {crit.spec}; {verdict.detail}"
+        return verdict
+
+    def _command_verdict(self, crit: Criterion, exit_code: int, stdout: str, stderr: str) -> Verdict:
+        """Turn a command's outcome into a verdict against the criterion's ``must``."""
+        combined = stdout + "\n" + stderr
+        wants = parse_must(crit.must or "exit=0")
+        notes: list[str] = []
+        if not wants:
+            # A `must` the parser does not understand must not turn into a
+            # criterion that always passes.  Measured: a model-proposed
+            # guard with ``must="exit status 0 with all tests passing"``
+            # has no ``key=value`` pair at all, so the criterion parsed to
+            # nothing and *always* passed -- a guard that can never catch
+            # anything.  Fall back to the default for commands.
+            wants = {"exit": ("=", "0")}
+            notes.append(f"unparsable must {crit.must!r}; using exit=0")
+        ok = True
+        for key, (op, val) in wants.items():
+            if key == "exit":
+                good = exit_code == int(val)
+                notes.append(f"exit={exit_code} (want {val})")
+            elif key in {"stdout", "stderr"}:
+                hay = stdout if key == "stdout" else stderr
+                good = bool(re.search(val, hay)) if op == "~=" else (val in hay)
+                notes.append(f"{key} {op} {val!r}: {good}")
+            elif key == "contains":
+                good = val in combined
+                notes.append(f"contains {val!r}: {good}")
+            else:
+                good = False
+                notes.append(f"unknown must-key {key}")
+            ok = ok and good
+        return Verdict(
+            crit.id, "L1", ok, "; ".join(notes) or f"exit={exit_code}",
+            evidence=combined[-1500:], reason="" if ok else "command_failed",
+        )
 
     def _check_l2(self, crit: Criterion, evidence: str) -> Verdict:
         if self.judge is None:

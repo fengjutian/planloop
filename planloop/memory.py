@@ -194,6 +194,41 @@ def _as_list(value: Any) -> list[str]:
     return [str(value)]
 
 
+def _match_glob(path: str, pattern: str) -> bool:
+    """Match a workspace path against a file glob.
+
+    ``fnmatch`` has no ``**`` semantics: it rewrites every ``*`` to ``.*``
+    (which also spans ``/``) but keeps the ``/`` **literal**, so
+    ``shop/**/*.py`` demands a directory *between* ``shop/`` and the file.
+    A model writes ``shop/**/*.py`` all the time -- measured on 2026-11-11,
+    one real model's lesson carried exactly that pattern and therefore
+    **never matched anything**: the lesson was written, stored, and never
+    fired once.  The same silent death as an unparsable regex, one layer
+    further down.
+
+    So the glob is matched segment by segment, with ``**`` standing for "zero
+    or more path segments".  ``fnmatch`` still handles the wildcards inside
+    a single segment.
+    """
+    path_parts = path.split("/")
+    pattern_parts = pattern.split("/")
+
+    def walk(p: list[str], g: list[str]) -> bool:
+        if not g:
+            return not p
+        head, rest = g[0], g[1:]
+        if head == "**":
+            # "**" matches zero or more segments
+            return walk(p, rest) or (bool(p) and walk(p[1:], g))
+        if not p:
+            return False
+        if not fnmatch.fnmatch(p[0], head):
+            return False
+        return walk(p[1:], rest)
+
+    return walk(path_parts, pattern_parts)
+
+
 def _first_match(patterns: list[str], text: str, flags: int = re.I) -> str | None:
     """The first pattern that matches ``text``.
 
@@ -256,7 +291,7 @@ class Trigger:
         if self.files:
             checked = True
             hit = next(
-                (f for f in ctx.files if any(fnmatch.fnmatch(f, g) for g in self.files)),
+                (f for f in ctx.files if any(_match_glob(f, g) for g in self.files)),
                 None,
             )
             if hit is None:

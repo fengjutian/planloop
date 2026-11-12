@@ -38,13 +38,14 @@ measured on the same footing:
 
 from __future__ import annotations
 
+import json
 import shutil
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from planloop import demo
+from planloop import heldout
 from planloop.memdb import MemorySystem
 from planloop.memory import MemoryStore
 from planloop.scheduler import RunResult, run
@@ -99,6 +100,15 @@ class Family:
     r1_oracle: str = ""
     r2_oracle: str = ""
     final_oracle: str = ""
+    #: what each held-out criterion checks, in words and **without numbers**.
+    #: The model is told the requirement (the goal says it too); what it is
+    #: never told is the answer.  A criterion that fails with a bare Python
+    #: error -- "total() takes 2 positional arguments but 3 were given" --
+    #: says nothing about what to fix, and a model that gets only that spins
+    #: in place (measured: it re-read the same file sixteen times).
+    r1_hint: str = ""
+    r2_hint: str = ""
+    final_hint: str = ""
     context_files: list[str] = field(default_factory=list)
     #: the verified fact the first task earns, and the key it is stored
     #: under.  A family that needs a different fact overrides them.
@@ -296,6 +306,21 @@ CONTRACT_FAMILY = Family(
     r1_oracle=ORACLE_PCT_CONTRACT,
     r2_oracle=ORACLE_MEMBER,
     final_oracle=ORACLE_FINAL,
+    r1_hint=(
+        "pct() must return the factor to multiply a subtotal by (what is left "
+        "of it after the discount), not the percentage itself -- and it must "
+        "hold for every percentage."
+    ),
+    r2_hint=(
+        "total() must take a third argument member_pct and apply the member "
+        "discount after the discount, through the same conversion helper as "
+        "discount_pct; the total without a member discount must not change."
+    ),
+    final_hint=(
+        "total() must apply the member discount after the discount, through "
+        "the same conversion helper as discount_pct, and the behaviour without "
+        "a member discount must be unchanged."
+    ),
     context_files=["shop/pricing.py", "shop/helpers.py", "tests/test_pricing.py"],
     # the second task does **not** carry shop/helpers.py: the contract it
     # needs is only in that file, so a model that does not already know it
@@ -450,7 +475,34 @@ FEE_FAMILY = Family(
     r1_oracle=ORACLE_PCT_FEE,
     r2_oracle=ORACLE_MEMBER_FEE,
     final_oracle=ORACLE_FINAL_FEE,
+    r1_hint=(
+        "pct() must return the payable factor for **every** discount tier: the "
+        "platform fee of the tier is deducted on top of the discount, so one "
+        "tier's factor says nothing about the next."
+    ),
+    r2_hint=(
+        "total() must take a third argument member_pct and apply the member "
+        "discount after the discount, through the same conversion helper as "
+        "discount_pct; the total without a member discount must not change."
+    ),
+    final_hint=(
+        "total() must apply the member discount after the discount, through "
+        "the same conversion helper as discount_pct, and the behaviour without "
+        "a member discount must be unchanged."
+    ),
     context_files=["shop/pricing.py", "shop/helpers.py", "tests/test_pricing.py"],
+    # The second task does **not** carry shop/helpers.py: the contract it
+    # needs is only in that file, so a model that does not already know it
+    # has to open the file -- and a memory that carries it does not.
+    #
+    # The first task *does* carry it.  Taking it away was tried (2026-11-11,
+    # .membench-fee17p): the model then read the same file 24 times without
+    # writing anything -- it spins instead of failing and fixing itself, so
+    # the first task ends "blocked" and no lesson is produced at all.  The
+    # cost of that: the first task is sometimes solved on the first write
+    # (3 of 8 repetitions), and then there is no lesson either.  The lesson
+    # yield is therefore decided by the model's behaviour, not by the
+    # device; the device can only *report* it.
     r2_context_files=["shop/pricing.py", "tests/test_pricing.py"],
     hidden_markers=["def pct("],
     fact_key="shop/pricing.py.pct_surcharge",
@@ -634,6 +686,10 @@ class ArmResult:
     invalid: int = 0
     first_action: str = ""
     hidden_looks: int = 0
+    #: the model saw the held-out criterion (the canary was found in this
+    #: run's event log): the repetition is contaminated and must not be
+    #: published as a measurement.
+    contaminated: bool = False
 
 
 @dataclass
@@ -649,6 +705,8 @@ class MemBenchResult:
     #: they decide whether the second task is even *consulted*.
     lesson_detail: list[dict[str, Any]] = field(default_factory=list)
     guard_injected_reps: list[bool] = field(default_factory=list)
+    #: the repetitions in which the model read the held-out criterion
+    contaminated_reps: list[int] = field(default_factory=list)
 
     def by_arm(self, arm: str) -> list[ArmResult]:
         return [a for a in self.arms if a.arm == arm]
@@ -699,19 +757,20 @@ def _restore(snapshot: Path, repo: Path) -> None:
 
 
 def _prepare_oracle(base: Path, name: str, source: str) -> str:
-    """Materialise a held-out test outside the workspace and return its command.
+    """DEPRECATED -- and the reason this module exists is to stop using it.
 
-    ``base`` must live outside the workspace: the tools lock every read and
-    write to the workspace root, so the model can neither read nor edit the
-    thing it is judged by.
+    This wrote the criterion to a file and handed the model the command that
+    reads it.  Measured on 2026-11-11: the model read that file three times
+    in one campaign (``cd /d ... && type ...oracle\\r1_oracle_1.py``), and the
+    criterion source contains the expected numbers -- so those runs were
+    contaminated.  A criterion that lives on disk is not held out.
+
+    Use :func:`planloop.heldout.run_held_out` instead: the criterion exists
+    only while the check runs.
     """
-    if not source:
-        return ""
-    oracle_dir = base / "oracle"
-    oracle_dir.mkdir(parents=True, exist_ok=True)
-    target = oracle_dir / f"{name}.py"
-    target.write_text(source, encoding="utf-8")
-    return f'"{sys.executable}" -m unittest discover -s "{oracle_dir}" -p "{name}.py" -q'
+    raise NotImplementedError(
+        "the criterion must not be written to disk; use planloop.heldout.run_held_out"
+    )
 
 
 def _measure(result: RunResult, spy: Spy, repo: Path, *, guard_injected: bool,
@@ -719,7 +778,7 @@ def _measure(result: RunResult, spy: Spy, repo: Path, *, guard_injected: bool,
     steps = sum(o.steps for o in result.outcomes)
     to_pass = sum(o.steps_to_pass for o in result.outcomes)
     tok_to_pass = sum(o.tokens_to_pass for o in result.outcomes)
-    failures = sum(len(o.failures) for o in result.outcomes)
+    failures = sum(o.l1_failures for o in result.outcomes)
     catches = sum(1 for o in result.outcomes for f in o.failures if f.get("guard_only"))
     usage = result.usage or {}
     suite_green = demo.suite_green(repo)
@@ -779,39 +838,54 @@ def scripted_model_for(arm: ArmSpec | None) -> Any:
 # --------------------------------------------------------------------------
 # the benchmark
 # --------------------------------------------------------------------------
-def _build_specs(base: Path, fam: Family, rep: int) -> tuple[dict, dict, dict]:
+def _build_specs(base: Path, fam: Family, rep: int, token: str = "") -> tuple[dict, dict, dict]:
     """Build the two task specs of a family, with their held-out criteria.
 
     Returned as plain dicts so a test can assert on them without running a
     model: the *shape* of the acceptance criteria is the measurement.
+
+    The held-out criteria are ``kind="held_out"``: their payload is the
+    answer key, so it is materialised only while the check runs and it is
+    never rendered into a prompt (:mod:`planloop.heldout`).  ``token`` is the
+    canary of this repetition -- it is put **into** the criterion, so a hit in
+    the event log means the model read the answer key and the repetition is
+    contaminated.
+
+    ``base`` is the run's directory; the criteria no longer live there (that
+    was how the model found them).
     """
-    r1_oracle_cmd = _prepare_oracle(base, f"r1_oracle_{rep}", fam.r1_oracle)
-    r2_oracle_cmd = _prepare_oracle(base, f"r2_oracle_{rep}", fam.r2_oracle)
-    final_oracle_cmd = _prepare_oracle(base, f"final_oracle_{rep}", fam.final_oracle)
+    def _criterion(cid: str, source: str, hint: str) -> dict[str, Any]:
+        return {
+            "id": cid,
+            "kind": "held_out",
+            "spec": hint or "a held-out criterion the verifier runs",
+            "source": heldout.with_canary(source, token) if token else source,
+            "must": "exit=0",
+        }
+
+    r1_source = fam.r1_oracle
+    r2_source = fam.r2_oracle
+    final_source = fam.final_oracle
 
     r1_node = list(fam.r1_node)
-    if r1_oracle_cmd:
-        r1_node = r1_node + [{"id": "A2", "kind": "command", "spec": r1_oracle_cmd, "must": "exit=0"}]
+    if r1_source:
+        r1_node = r1_node + [_criterion("A2", r1_source, fam.r1_hint)]
     # The node of the second task is judged by the *new* feature only.
     # That gap is the point: a node can pass while the repository is
     # broken, and what closes the gap is what this benchmark measures.
     r2_node = list(fam.r2_node)
-    if r2_oracle_cmd:
-        r2_node = [{"id": "A1", "kind": "command", "spec": r2_oracle_cmd, "must": "exit=0"}]
+    if r2_source:
+        r2_node = [_criterion("A1", r2_source, fam.r2_hint)]
     r1_success = list(fam.r1_success) or list(r1_node)
-    if r1_oracle_cmd:
-        r1_success = r1_success + [
-            {"id": "SC2", "kind": "command", "spec": r1_oracle_cmd, "must": "exit=0"}
-        ]
+    if r1_source:
+        r1_success = r1_success + [_criterion("SC2", r1_source, fam.r1_hint)]
     r2_success = list(fam.r2_success) or list(r2_node)
-    if final_oracle_cmd:
-        r2_success = [
-            {"id": "SC1", "kind": "command", "spec": final_oracle_cmd, "must": "exit=0"}
-        ]
+    if final_source:
+        r2_success = [_criterion("SC1", final_source, fam.final_hint)]
 
     r1_spec = fam.spec(fam.r1_goal, r1_node, r1_success, fam.r1_node_goal, fam.files_for("r1"))
     r2_spec = fam.spec(fam.r2_goal, r2_node, r2_success, fam.r2_node_goal, fam.files_for("r2"))
-    oracles = {"r1": r1_oracle_cmd, "r2": r2_oracle_cmd, "final": final_oracle_cmd}
+    oracles = {"r1": r1_source, "r2": r2_source, "final": final_source}
     return r1_spec, r2_spec, oracles
 
 
@@ -843,16 +917,23 @@ def run_membench(
     lessons_seen: list[int] = []
     lesson_detail: list[dict[str, Any]] = []
     guard_injected_reps: list[bool] = []
+    contaminated_reps: list[int] = []
     facts_stored = 0
 
     for rep in range(1, reps + 1):
         _reset_repo(repo, fam)
 
         # -- the held-out criteria -----------------------------------------
-        r1_spec, r2_spec, oracles = _build_specs(base, fam, rep)
+        # the canary of this repetition: it goes *into* the criterion, so a
+        # hit in the event log means the model read the answer key and the
+        # repetition is contaminated.  "The criterion was held out" has to
+        # be a check, not a claim.
+        token = heldout.canary_token()
+        r1_spec, r2_spec, oracles = _build_specs(base, fam, rep, token)
         r1_oracle_cmd = oracles["r1"]
         r2_oracle_cmd = oracles["r2"]
         final_oracle_cmd = oracles["final"]
+        _write_canaries(base, rep, token)
 
         memory_path = base / f"memory_setup_{rep}.jsonl"
         if memory_path.exists():
@@ -928,6 +1009,7 @@ def run_membench(
 
         # -- measured arms: the second task of the family ------------------
         rep_guard_injected = False
+        rep_arms: list[ArmResult] = []
         for spec in arm_plan:
             _restore(snapshot, repo)
             arm_memory_path = base / f"memory_{spec.label}_{rep}.jsonl"
@@ -965,6 +1047,21 @@ def run_membench(
             measured.first_action = stats.first_label
             measured.hidden_looks = stats.hidden_looks
             arm_results.append(measured)
+            rep_arms.append(measured)
+
+        # -- was the criterion really held out in this repetition? ---------
+        # the canary is inside the criterion source; the source only exists
+        # while a check runs, so a hit means the model read the answer key.
+        rep_logs = [base / f"events_setup_{rep}.jsonl"] + [
+            base / f"events_{spec.label}_{rep}.jsonl" for spec in arm_plan
+        ]
+        leaks = heldout.find_canary(rep_logs, token)
+        leaks += heldout.find_canary([p for p in repo.rglob("*") if p.is_file()], token)
+        if leaks:
+            contaminated_reps.append(rep)
+            setup.contaminated = True
+            for measured in rep_arms:
+                measured.contaminated = True
 
         guard_injected_reps.append(rep_guard_injected)
 
@@ -986,6 +1083,7 @@ def run_membench(
                 facts_stored=facts_stored,
                 lesson_detail=list(lesson_detail),
                 guard_injected_reps=list(guard_injected_reps),
+                contaminated_reps=list(contaminated_reps),
             ))
 
     return MemBenchResult(
@@ -998,18 +1096,36 @@ def run_membench(
         facts_stored=facts_stored,
         lesson_detail=lesson_detail,
         guard_injected_reps=guard_injected_reps,
+        contaminated_reps=contaminated_reps,
     )
 
 
-def _oracle_green(command: str, repo: Path) -> bool:
-    """Run a held-out oracle against the workspace and report pass/fail."""
-    import subprocess
+def _write_canaries(base: Path, rep: int, token: str) -> None:
+    """Record the canary of a repetition next to its artifacts.
 
-    proc = subprocess.run(
-        command, shell=True, cwd=str(repo), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", timeout=120,
-    )
-    return proc.returncode == 0
+    The verification tool needs it to re-check the raw event logs, so it is
+    written per repetition (a run that dies at rep 7 keeps reps 1-6).
+    """
+    path = base / "canaries.json"
+    data: dict[str, str] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            data = {}
+    data[str(rep)] = token
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _oracle_green(source: str, repo: Path) -> bool:
+    """Run a held-out criterion against the workspace and report pass/fail.
+
+    The criterion is materialised for the duration of the run and deleted
+    again: while the model acts, the answer key is not on disk.
+    """
+    if not source:
+        return False
+    return heldout.run_held_out(source, repo, name="oracle").ok
 
 
 # --------------------------------------------------------------------------
@@ -1049,9 +1165,15 @@ def to_markdown(result: MemBenchResult) -> str:
     add("")
     add("## 一、结论")
     add("")
-    control = [a for a in result.by_arm("no_memory") if not a.model_failed]
-    lessons = [a for a in result.by_arm("lesson_and_guard") if not a.model_failed]
-    facts = [a for a in result.by_arm("fact_only") if not a.model_failed]
+    control = [a for a in result.by_arm("no_memory") if not a.model_failed and not a.contaminated]
+    lessons = [a for a in result.by_arm("lesson_and_guard") if not a.model_failed and not a.contaminated]
+    facts = [a for a in result.by_arm("fact_only") if not a.model_failed and not a.contaminated]
+    if result.contaminated_reps:
+        add(f"- **被污染的重复：{len(result.contaminated_reps)} 次"
+            f"（rep {', '.join(str(r) for r in result.contaminated_reps)}）**——"
+            "模型读到了仓外判据的源码（事件流里扫到了判据里的 canary），"
+            "这些重复的数字**不进下面的统计**：判据一旦泄题，测的就不是记忆了。")
+        add("")
     if control:
         green = sum(1 for a in control if a.verdict_green)
         add(f"- 第一次任务（R1）留下：教训 {result.lessons_after_setup} 条、已验证事实 {result.facts_stored} 条")
@@ -1089,7 +1211,10 @@ def to_markdown(result: MemBenchResult) -> str:
             verdict = "**结果没有差异**"
         else:
             verdict = f"结果差异 {c_green}/{len(control)} vs {l_green}/{len(lessons)}"
-        cost = f"少花 {-delta:.0%} tokens" if delta < 0 else f"多花 {delta:+.0%} tokens"
+        if not c_tokens:
+            cost = "（对照臂还没有可用数据）"
+        else:
+            cost = f"少花 {-delta:.0%} tokens" if delta < 0 else f"多花 {delta:+.0%} tokens"
         add(f"- **一句话**：教训确实进了 prompt，但{verdict}，"
             f"代价是**{cost}**（{c_tokens:.0f} → {l_tokens:.0f}）。")
     if control and facts:
@@ -1097,10 +1222,16 @@ def to_markdown(result: MemBenchResult) -> str:
         f_work = _mean([a.steps_to_pass for a in facts])
         c_tok = _mean([a.tokens_to_pass for a in control])
         f_tok = _mean([a.tokens_to_pass for a in facts])
+        # The report is written after *every* rep, so it must survive a run
+        # whose first rep produced nothing: a zero denominator is a normal
+        # state here, not an error.  Measured on 2026-11-11, a division by
+        # zero in this line killed a whole 8-rep campaign **after the model
+        # calls had already been paid for**.
+        delta = f"{(f_tok - c_tok) / c_tok:+.0%}" if c_tok else "（对照臂还没有可用数据）"
         add(f"- **成本口径（对照 vs 事实，两臂验收集合相同）**："
             f"做到验收通过要 **{c_work:.1f} → {f_work:.1f} 步**，"
             f"**{c_tok:.0f} → {f_tok:.0f} tokens**"
-            f"（{(f_tok - c_tok) / c_tok:+.0%}）。")
+            f"（{delta}）。")
     if control and lessons:
         c_green = sum(1 for a in control if a.verdict_green)
         l_green = sum(1 for a in lessons if a.verdict_green)
@@ -1148,7 +1279,7 @@ def to_markdown(result: MemBenchResult) -> str:
     add("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for arm in result.arm_names():
         items = result.by_arm(arm)
-        ok = [a for a in items if not a.model_failed]
+        ok = [a for a in items if not a.model_failed and not a.contaminated]
         green = sum(1 for a in ok if a.verdict_green)
         suite = sum(1 for a in ok if a.suite_green_after)
         prompts = sum(a.prompts for a in ok)
@@ -1179,13 +1310,14 @@ def to_markdown(result: MemBenchResult) -> str:
     add("")
     add("## 三、逐次明细")
     add("")
-    add("| rep | 臂 | 状态 | 到验收通过：步数 | 到验收通过：tokens | 总步数 | 模型调用 | 总 tokens | L1 失败 | 护栏拦截 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
-    add("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    add("| rep | 臂 | 状态 | 到验收通过：步数 | 到验收通过：tokens | 总步数 | 模型调用 | 总 tokens | L1 失败 | 护栏拦截 | 无效回复 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
+    add("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for item in result.setup + result.arms:
+        status = item.status + (" **污染**" if item.contaminated else "")
         add(
-            f"| {item.rep} | {item.label} | {item.status} | {item.steps_to_pass} | {item.tokens_to_pass} | "
+            f"| {item.rep} | {item.label} | {status} | {item.steps_to_pass} | {item.tokens_to_pass} | "
             f"{item.steps} | {item.model_calls} | "
-            f"{item.tokens} | {item.l1_failures} | {item.guard_catches} | "
+            f"{item.tokens} | {item.l1_failures} | {item.guard_catches} | {item.invalid} | "
             f"{item.prompts_with_lesson}/{item.prompts} | {item.prompts_with_facts}/{item.prompts} | "
             f"{'绿' if item.verdict_green else '**红**'} | "
             f"{'绿' if item.suite_green_after else '**红**'} |"

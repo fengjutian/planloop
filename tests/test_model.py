@@ -122,5 +122,75 @@ class OpenAICompatRetryTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class ModelCallDeadlineTest(unittest.TestCase):
+    """A call that never returns must not take the run down with it.
+
+    Measured on 2026-11-11: one chat completion hung for fifteen minutes with
+    the connection still established, and it took a whole 8-rep campaign with
+    it.  A socket timeout does not catch that -- it only fires when a *read*
+    stalls, and a server that keeps trickling bytes resets it forever.  The
+    deadline is enforced by the caller, in a thread of its own.
+    """
+
+    def _model(self, deadline: float = 0.3) -> OpenAICompatModel:
+        return OpenAICompatModel(
+            "MiniMax-M3.1-Flash",
+            base_url="http://127.0.0.1:1/v1",
+            api_key="k",
+            deadline=deadline,
+        )
+
+    def test_a_hanging_call_raises_instead_of_hanging(self):
+        import threading
+        import time as _time
+
+        # NOTE: ``time.sleep`` is patched below (to skip the retry backoff),
+        # and that patches the *global* time module -- so the fake endpoint
+        # waits on an Event instead of sleeping.
+        release = threading.Event()
+
+        def hanging_urlopen(req, timeout=None):
+            release.wait(30)
+            raise AssertionError("never reached")
+
+        started = _time.time()
+        try:
+            with mock.patch("planloop.model.urllib.request.urlopen", side_effect=hanging_urlopen), \
+                    mock.patch("planloop.model.time.sleep"):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._model().complete("hello")
+        finally:
+            release.set()
+        elapsed = _time.time() - started
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertLess(elapsed, 20, "the deadline did not stop the hanging call")
+
+    def test_a_timeout_is_not_retried(self):
+        """A provider that is not answering will not answer on the second try."""
+        calls = []
+
+        def hanging_urlopen(req, timeout=None):
+            calls.append(req)
+            import threading
+            threading.Event().wait(30)
+            raise AssertionError("never reached")
+
+        import threading
+        release = threading.Event()
+        with mock.patch("planloop.model.urllib.request.urlopen", side_effect=hanging_urlopen), \
+                mock.patch("planloop.model.time.sleep"):
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._model().complete("hello")
+            finally:
+                release.set()
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertEqual(len(calls), 1, "a timed-out call was retried")
+
+    def test_the_deadline_is_configurable(self):
+        model = OpenAICompatModel("m", base_url="http://x/v1", api_key="k", deadline=7.5)
+        self.assertEqual(model.deadline, 7.5)
+
+
 if __name__ == "__main__":
     unittest.main()

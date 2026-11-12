@@ -15,6 +15,7 @@ with no value, and the report must be able to say so.
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,7 @@ from planloop.membench import (
     analyze_events,
     run_membench,
 )
+from planloop.membench_verify import recompute
 
 
 class MemoryValueTest(unittest.TestCase):
@@ -148,27 +150,40 @@ class ContractFamilyTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_oracles_are_written_outside_the_workspace(self):
-        for label, cmd in self.oracles.items():
-            self.assertTrue(cmd, f"{label} oracle has no command")
-            self.assertNotIn(str(self.repo).replace("\\", "/"), cmd.replace("\\", "/"))
+    def test_the_criterion_is_never_written_to_disk(self):
+        """A criterion that lives on disk is not held out.
+
+        Measured on 2026-11-11: the model read the criterion file three times
+        with ``cd /d ... && type ...`` -- the workspace lock stops the ``read``
+        tool, not the shell -- and the source contains the expected numbers.
+        So the criterion is not written anywhere: it is materialised for the
+        duration of a check and deleted again.
+        """
+        for label, source in self.oracles.items():
+            self.assertTrue(source, f"{label} criterion has no source")
         self.assertFalse((self.repo / "oracle").exists())
+        for path in Path(self.tmp.name).rglob("*oracle*.py"):
+            self.fail(f"the criterion was written to disk: {path}")
 
     def test_second_node_is_judged_by_the_new_feature_only(self):
-        specs = [c["spec"] for c in self.r2["plan_template"]["nodes"][0]["acceptance"]]
-        self.assertEqual(len(specs), 1)
-        self.assertIn("r2_oracle", specs[0])
-        self.assertNotIn("r1_oracle", specs[0])
+        criteria = self.r2["plan_template"]["nodes"][0]["acceptance"]
+        self.assertEqual(len(criteria), 1)
+        self.assertEqual(criteria[0]["kind"], "held_out")
+        self.assertEqual(criteria[0]["source"], CONTRACT_FAMILY.r2_oracle)
+        self.assertNotIn(CONTRACT_FAMILY.r1_oracle, criteria[0]["source"])
 
     def test_run_level_verdict_checks_the_old_behaviour(self):
-        specs = [c["spec"] for c in self.r2["success_criteria"]]
-        self.assertEqual(len(specs), 1)
-        self.assertIn("final_oracle", specs[0])
+        criteria = self.r2["success_criteria"]
+        self.assertEqual(len(criteria), 1)
+        self.assertEqual(criteria[0]["kind"], "held_out")
+        self.assertEqual(criteria[0]["source"], CONTRACT_FAMILY.final_oracle)
 
     def test_first_task_is_judged_by_the_visible_suite_and_the_contract(self):
-        specs = [c["spec"] for c in self.r1["plan_template"]["nodes"][0]["acceptance"]]
-        self.assertEqual(len(specs), 2)
-        self.assertIn("r1_oracle", specs[1])
+        criteria = self.r1["plan_template"]["nodes"][0]["acceptance"]
+        self.assertEqual(len(criteria), 2)
+        self.assertEqual(criteria[0]["kind"], "command")
+        self.assertEqual(criteria[1]["kind"], "held_out")
+        self.assertEqual(criteria[1]["source"], CONTRACT_FAMILY.r1_oracle)
 
     def test_every_oracle_is_red_on_the_untouched_repository(self):
         for label in ("r1", "r2", "final"):
@@ -316,6 +331,24 @@ class FeeFamilyTest(unittest.TestCase):
     def test_the_second_task_still_hides_the_contract_file(self):
         self.assertNotIn("shop/helpers.py", FEE_FAMILY.r2_context_files)
 
+    def test_the_first_task_does_carry_the_contract_file(self):
+        """The setup task must stay solvable -- and the cost of that is known.
+
+        ``shop/helpers.py`` holds the contract: the tier table and the rule
+        "the platform fee is deducted on top of the discount".  Taking it out
+        of the first task's prompt was tried (2026-11-11, ``.membench-fee17p``):
+        the model then read the same file 24 times without writing anything
+        -- it spins instead of failing and fixing itself -- so the first task
+        ended "blocked" and **no lesson was produced at all**.  With the file
+        in the prompt the first task is sometimes solved on the first write
+        (3 of 8 repetitions), and then there is no lesson either: the lesson
+        yield is decided by the model's behaviour, not by the device.
+        """
+        self.assertIn("shop/helpers.py", self.r1["context_files"])
+        self.assertNotIn("shop/helpers.py", self.r2["context_files"])
+        self.assertTrue((self.repo / "shop" / "helpers.py").exists(),
+                        "the contract file must stay in the repository")
+
     def test_every_oracle_is_red_on_the_untouched_repository(self):
         for label in ("r1", "r2", "final"):
             self.assertFalse(
@@ -372,3 +405,164 @@ class ModelFailureTest(unittest.TestCase):
 
     def test_a_run_with_tokens_is_not_flagged(self):
         self.assertFalse(self._measure({"calls": 12, "tokens": 14000}).model_failed)
+
+
+class VerifyTest(unittest.TestCase):
+    """The published numbers must be derivable from the raw artifacts.
+
+    2026-11-11: the numbers of a real 8-rep run were **typed into the
+    document by hand**, and four of them were wrong at once -- most of them
+    because the failures were **not aligned across arms** (the control arm's
+    rep 6 ran fine and was judged green, so dropping "rep 6/7/8" threw away a
+    valid control run) and one because a total mixed denominators.
+
+    A number that is typed twice is a number that will be wrong.  So the
+    numbers are re-derived from the event logs and cross-checked against the
+    machine report -- and this module is what does that.
+    """
+
+    def _fixture(self, tmp: Path, rows: list[dict], events: dict[str, list[str]]):
+        """Write a tiny fake run: a machine report plus event logs."""
+        run_dir = tmp / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        header = ("| rep | 臂 | 状态 | steps2pass | tok2pass | 总步数 | 模型调用 | 总 tokens | "
+                  "L1 失败 | 护栏拦截 | 无效回复 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
+        lines = [header, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for row in rows:
+            cells = [str(row[c]) for c in (
+                "rep", "arm", "status", "steps_to_pass", "tokens_to_pass", "total_steps",
+                "model_calls", "tokens", "l1_failures", "guard_catches")]
+            cells.append(str(row.get("invalid", 0)))
+            cells += [str(row[c]) for c in (
+                "prompts_lesson", "prompts_facts", "verdict", "suite")]
+            lines.append("| " + " | ".join(cells) + " |")
+        report = tmp / "report.md"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for name, records in events.items():
+            (run_dir / f"events_{name}.jsonl").write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+                encoding="utf-8",
+            )
+        return run_dir, report
+
+    def _action(self, target: str, detail: str = "ok"):
+        return {"kind": "action", "data": {"action": "read", "target": target, "detail": detail}}
+
+    def test_a_broken_run_leaves_the_denominator(self):
+        """0 tokens and 2 calls: the model never answered -> the harness broke."""
+        rows = [
+            {"rep": 1, "arm": "R2_none", "status": "succeeded", "steps_to_pass": 2,
+             "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+             "l1_failures": 0, "guard_catches": 0, "prompts_lesson": "0/12",
+             "prompts_facts": "0/12", "verdict": "绿", "suite": "绿"},
+            {"rep": 2, "arm": "R2_none", "status": "blocked", "steps_to_pass": 0,
+             "tokens_to_pass": 0, "total_steps": 2, "model_calls": 2, "tokens": 0,
+             "l1_failures": 0, "guard_catches": 0, "prompts_lesson": "0/2",
+             "prompts_facts": "0/2", "verdict": "红", "suite": "红"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            events = {
+                "R2_none_1": [{"kind": "action", "data": {"action": "read", "target": "a.py"}}],
+                "R2_none_2": [],
+            }
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            self.assertEqual(result.usable["no_memory"], [1])
+            self.assertEqual(result.broken["no_memory"], [2])
+
+    def test_failures_that_are_not_aligned_across_arms_are_reported(self):
+        """The control arm had one valid rep more than the other two.
+
+        That is the trap: dropping "rep 6/7/8" by hand would throw away a
+        valid control run, and the comparison would stop being paired.
+        """
+        rows = []
+        events = {}
+        for rep, arm in ((1, "R2_none"), (2, "R2_none"), (6, "R2_none")):
+            broken = rep == 6
+            rows.append({
+                "rep": rep, "arm": arm, "status": "blocked" if broken else "succeeded",
+                "steps_to_pass": 0 if broken else 2, "tokens_to_pass": 0 if broken else 100,
+                "total_steps": 2 if broken else 12, "model_calls": 2 if broken else 12,
+                "tokens": 0 if broken else 1000, "l1_failures": 0, "guard_catches": 0,
+                "prompts_lesson": "0/2" if broken else "0/12",
+                "prompts_facts": "0/2" if broken else "0/12",
+                "verdict": "红" if broken else "绿", "suite": "红" if broken else "绿",
+            })
+            events[f"{arm}_{rep}"] = (
+                [] if broken
+                else [{"kind": "action", "data": {"action": "read", "target": "a.py"}}]
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            self.assertEqual(result.usable["no_memory"], [1, 2])
+            self.assertEqual(result.broken["no_memory"], [6])
+
+    def test_a_report_that_disagrees_with_the_event_log_is_flagged(self):
+        """The event log is the truth: a failure count that does not match fails."""
+        rows = [{
+            "rep": 1, "arm": "R2_none", "status": "succeeded", "steps_to_pass": 2,
+            "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+            "l1_failures": 0, "guard_catches": 0, "prompts_lesson": "0/12",
+            "prompts_facts": "0/12", "verdict": "绿", "suite": "绿",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            events = {"R2_none_1": [
+                {"kind": "failure", "data": {"reason": "boom"}},
+                {"kind": "action", "data": {"action": "read", "target": "a.py"}},
+            ]}
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            self.assertTrue(result.mismatches)
+            self.assertIn("failure", result.mismatches[0])
+
+    def test_an_old_report_gets_a_note_instead_of_a_mismatch(self):
+        """A report from before the counting fix cannot be re-derived exactly.
+
+        Old reports counted *distinct* failures per attempt; the log records
+        every failing check.  Calling that a disagreement would make the gate
+        permanently red on old runs -- and a gate that is always red is a gate
+        nobody reads.  So it is a note, with the row spelled out.
+        """
+        header = ("| rep | 臂 | 状态 | steps2pass | tok2pass | 总步数 | 模型调用 | 总 tokens | "
+                  "L1 失败 | 护栏拦截 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
+        row = "| 1 | R2_none | succeeded | 2 | 100 | 12 | 12 | 1000 | 0 | 0 | 0/12 | 0/12 | 绿 | 绿 |"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir = tmp / "run"
+            run_dir.mkdir()
+            report = tmp / "report.md"
+            report.write_text("\n".join([header, row]) + "\n", encoding="utf-8")
+            (run_dir / "events_R2_none_1.jsonl").write_text(
+                json.dumps({"kind": "failure", "data": {"reason": "boom"}}) + "\n"
+                + json.dumps({"kind": "action", "data": {"action": "read", "target": "a.py"}}) + "\n",
+                encoding="utf-8",
+            )
+            result = recompute(run_dir, report, FEE_FAMILY)
+            self.assertFalse(result.mismatches, result.mismatches)
+            self.assertTrue(result.notes)
+            self.assertIn("R2_none rep 1", result.notes[0])
+
+    def test_the_hidden_looks_come_from_the_event_log_not_the_report(self):
+        """Behaviour is re-derived, never copied from the report."""
+        rows = [{
+            "rep": 1, "arm": "R2_none", "status": "succeeded", "steps_to_pass": 2,
+            "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+            "l1_failures": 0, "guard_catches": 0, "prompts_lesson": "0/12",
+            "prompts_facts": "0/12", "verdict": "绿", "suite": "绿",
+        }]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            events = {"R2_none_1": [
+                self._action("shop/helpers.py", "def pct(value): ..."),
+                self._action("shop/pricing.py", "def total(...): ..."),
+            ]}
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            summary = result.summaries["R2_none"]
+            self.assertEqual(summary.hidden_looks, 1,
+                             "the hidden contract was read once in the event log")

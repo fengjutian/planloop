@@ -451,6 +451,24 @@ def _cmd_membench(args: argparse.Namespace) -> int:
     # contract family, not the demo one
     family = families.get(args.family or ("contract" if args.real else "demo"), DEMO_FAMILY)
 
+    if args.verify:
+        # recompute the published numbers from the raw artifacts and cross-check
+        # them against the machine report: a number that is typed twice is a
+        # number that will be wrong
+        from planloop.membench_verify import format_report, recompute
+
+        base = Path(args.dir)
+        report = Path(args.report) if args.report else None
+        if report is None:
+            print("membench --verify needs --report <machine report .md>", file=sys.stderr)
+            return 2
+        if not report.exists():
+            print(f"no such report: {report}", file=sys.stderr)
+            return 2
+        result = recompute(base, report, family)
+        print(format_report(result))
+        return 1 if result.mismatches else 0
+
     if args.analyze:
         # read the behaviour back out of a finished run, without re-running
         # it: the question "did the memory change what the model did?" is
@@ -603,6 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
     membench.add_argument("--family", default="", help="demo | contract | fee")
     membench.add_argument("--analyze", action="store_true",
                           help="read the behaviour back out of a finished run dir, without running")
+    membench.add_argument("--verify", action="store_true",
+                          help="recompute the published numbers from the raw artifacts and "
+                               "cross-check them against the machine report")
+    membench.add_argument("--report", default="",
+                          help="the machine report .md to cross-check against (used by --verify)")
     membench.add_argument("-w", "--workspace", default=".")
     membench.set_defaults(func=_cmd_membench)
 

@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import re
+import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -151,6 +152,19 @@ class OpenAICompatModel:
     """Minimal chat-completions client (OpenAI-compatible endpoints, stdlib only).
 
     Configure with ``PLANLOOP_BASE_URL``, ``PLANLOOP_API_KEY``, ``PLANLOOP_MODEL``.
+
+    Two timeouts, and the difference matters: ``timeout`` is the **socket**
+    timeout (how long a single read may stall), the **budget** is the total
+    time one call may take.  The socket timeout alone is not enough: a server
+    that keeps the connection open and trickles bytes never trips it, and the
+    call never returns.  Measured on 2026-11-11: one chat completion hung for
+    fifteen minutes with the connection still established, and it took a whole
+    8-rep campaign down with it.
+
+    The budget is derived from the answer size (a call that may write 4096
+    tokens needs longer than one that may write 1200), and a call that ran
+    out of budget is **not** retried: a provider that is not answering is not
+    going to answer on the second try either.
     """
 
     def __init__(
@@ -160,7 +174,8 @@ class OpenAICompatModel:
         base_url: str | None = None,
         api_key: str | None = None,
         temperature: float = 0.2,
-        timeout: float = 120.0,
+        timeout: float = 60.0,
+        deadline: float | None = None,
     ):
         self.name = f"openai-compat:{model}"
         self.model = model
@@ -168,6 +183,44 @@ class OpenAICompatModel:
         self.api_key = api_key or os.environ.get("PLANLOOP_API_KEY", "")
         self.temperature = temperature
         self.timeout = timeout
+        #: an explicit budget overrides the size-derived one
+        self.deadline = deadline
+        #: the floor for the size-derived budget (seconds)
+        self.base_deadline = float(os.environ.get("PLANLOOP_MODEL_DEADLINE", "60"))
+
+    def _post(self, req: urllib.request.Request, max_tokens: int = 900) -> dict:
+        """POST the request, but give up after the deadline.
+
+        The request runs in a daemon thread: the deadline is enforced by the
+        *caller*, not by the socket.  A socket timeout only fires when a read
+        stalls; a server that trickles bytes keeps it alive forever.
+
+        The budget scales with the answer size: a call that may write 4096
+        tokens needs longer than one that may write 1200, and the budget has
+        to be known *before* the call, not after it stalls.
+        """
+        budget = self.deadline if self.deadline is not None else max(
+            self.base_deadline, min(200.0, max_tokens / 25.0)
+        )
+        box: dict[str, Any] = {}
+
+        def worker() -> None:
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    box["data"] = json.loads(resp.read().decode("utf-8"))
+            except BaseException as exc:  # noqa: BLE001 - reported to the caller
+                box["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(budget)
+        if thread.is_alive():
+            raise TimeoutError(
+                f"model call did not finish within {budget:.0f}s"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box.get("data", {})
 
     def complete(self, prompt: str, *, max_tokens: int = 900) -> Completion:
         payload = {
@@ -188,14 +241,19 @@ class OpenAICompatModel:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
+                data = self._post(req, max_tokens)
                 break
             except urllib.error.HTTPError as exc:
                 body = exc.read()[:300]
                 last_error = RuntimeError(f"model HTTP {exc.code}: {body!r}")
                 if exc.code < 500 and exc.code != 429:
                     raise last_error from exc
+            except TimeoutError as exc:
+                # A provider that is not answering is not going to answer on
+                # the second try either: retrying only burns wall clock (and
+                # the whole campaign with it).  Give up on this call.
+                last_error = RuntimeError(f"model call timed out: {exc}")
+                raise last_error from exc
             except (urllib.error.URLError, TimeoutError) as exc:
                 last_error = RuntimeError(f"model unreachable: {exc}")
             if attempt < 2:
