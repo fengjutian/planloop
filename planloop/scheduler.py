@@ -36,6 +36,27 @@ from planloop.verify import VerificationReport, Verifier
 from planloop.workspace import GitError, GitWorkspace
 
 
+def _record_interrupted(result: RunResult, exc: Exception) -> None:
+    """Record the outcome of an attempt that a policy check cut short.
+
+    The attempt really ran: it spent steps and it recorded L1 failures, and
+    both are in the event log.  Dropping it here is what made the *report*
+    disagree with the *log* -- the report counts L1 failures out of the
+    attempts it has, so a dropped attempt silently under-counted (a real run:
+    12 steps and 1 failure in the report, 19 actions and 2 failures in the
+    log).
+
+    It goes into its own list, not into ``outcomes``: ``outcomes`` means
+    "attempts that ran to a verdict", and the mutation bench counts its
+    length as *completed executor runs* -- an attempt the policy cut short
+    never measured the acceptance, and counting it as a failed attempt
+    biases every arm that gets interrupted.
+    """
+    outcome = getattr(exc, "outcome", None)
+    if outcome is not None:
+        result.interrupted.append(outcome)
+
+
 @dataclass
 class BlockedReport:
     reason: str
@@ -65,6 +86,10 @@ class RunResult:
     verification: VerificationReport | None = None
     blocked: BlockedReport | None = None
     outcomes: list[NodeOutcome] = field(default_factory=list)
+    #: the attempts a policy check cut short.  They spent steps and recorded
+    #: failures -- the event log has both -- but they never ran to a verdict,
+    #: so they are not ``outcomes`` (see :func:`_record_interrupted`).
+    interrupted: list[NodeOutcome] = field(default_factory=list)
     usage: dict[str, Any] = field(default_factory=dict)
     memory_summary: dict[str, Any] = field(default_factory=dict)
     lessons_learned: list[str] = field(default_factory=list)
@@ -86,6 +111,7 @@ class RunResult:
             "blocked": self.blocked.to_dict() if self.blocked else None,
             "compile": self.compile_report.to_dict() if self.compile_report else None,
             "outcomes": [o.to_dict() for o in self.outcomes],
+            "interrupted": [o.to_dict() for o in self.interrupted],
             "usage": self.usage,
             "routing": self.routing,
             "memory": self.memory_summary,
@@ -524,6 +550,7 @@ def run(
         try:
             outcome = executor.run(node, plan, extra_context=guidance.pop(node.id, ""))
         except NeedsApproval as exc:
+            _record_interrupted(result, exc)
             node.status = "pending"
             result.status = "blocked"
             result.blocked = BlockedReport(
@@ -542,6 +569,7 @@ def run(
             _persist(state, plan, ledger, policy, result, bb, "blocked")
             break
         except DeniedAction as exc:
+            _record_interrupted(result, exc)
             node.status = "failed"
             result.status = "blocked"
             result.blocked = BlockedReport(
@@ -558,6 +586,7 @@ def run(
             _persist(state, plan, ledger, policy, result, bb, "blocked")
             break
         except BudgetExceeded as exc:
+            _record_interrupted(result, exc)
             node.status = "pending"
             result.status = "blocked"
             result.blocked = BlockedReport(reason=str(exc), node_id=node.id, needed="raise the budget")

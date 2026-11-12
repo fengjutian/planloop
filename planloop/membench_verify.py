@@ -212,7 +212,8 @@ def parse_report(report_path: Path) -> list[RunRow]:
 
 def count_events(log_path: Path) -> dict[str, int]:
     """Count the event kinds the report's columns are derived from."""
-    counts = {"action": 0, "failure": 0, "invalid_action": 0, "node_end": 0, "run_end": 0}
+    counts = {"action": 0, "failure": 0, "invalid_action": 0, "node_end": 0, "run_end": 0,
+              "node_start": 0, "interrupted": 0}
     if not log_path.exists():
         return counts
     for line in log_path.read_text(encoding="utf-8").splitlines():
@@ -226,7 +227,26 @@ def count_events(log_path: Path) -> dict[str, int]:
         kind = rec.get("kind")
         if kind in counts:
             counts[kind] += 1
+        if kind == "node_end" and str((rec.get("data") or {}).get("status")) == "interrupted":
+            # an attempt that a policy check cut short.  It spent steps and it
+            # recorded failures, and it never returned an outcome -- so a
+            # report that dropped it counts fewer steps and fewer failures
+            # than the log holds.
+            counts["interrupted"] += 1
     return counts
+
+
+def log_steps(counts: dict[str, int]) -> int:
+    """The number of steps the event log accounts for.
+
+    Every step of the act loop is one model call, and it ends in exactly one
+    of three ways: an ``action``, an ``invalid_action`` (a reply the harness
+    could not parse), or a policy check that cut the attempt short.  So the
+    step count is re-derivable from the log -- which is how a **dropped
+    attempt** shows up: the report counts fewer steps than the log holds.
+    """
+    cut_short = counts["interrupted"] + max(0, counts["node_start"] - counts["node_end"])
+    return counts["action"] + counts["invalid_action"] + cut_short
 
 
 @dataclass
@@ -245,6 +265,8 @@ class Recomputed:
     summaries: dict[str, ArmSummary] = field(default_factory=dict)
     #: the behaviour read back from the event logs
     stats: dict[tuple[str, int], EventStats] = field(default_factory=dict)
+    #: the event counts per (arm, rep), or ``None`` when the log is missing
+    log_counts: dict[tuple[str, int], dict[str, int] | None] = field(default_factory=dict)
     #: disagreements between the machine report and the event logs
     mismatches: list[str] = field(default_factory=list)
     #: things that are worth saying but are not a disagreement (e.g. a column
@@ -318,6 +340,20 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
             stats = analyze_events(log, family.hidden_markers)
             out.stats[(row.arm, row.rep)] = stats
             counts = count_events(log)
+            out.log_counts[(row.arm, row.rep)] = counts if log.exists() else None
+
+            # an attempt that a policy check cut short: it started, it spent
+            # steps, it recorded failures -- and it never returned an
+            # outcome, so a report made before the executor recorded it
+            # counts fewer steps and fewer failures than the log holds
+            cut_short = counts["interrupted"] + max(0, counts["node_start"] - counts["node_end"])
+            steps = log_steps(counts)
+            if cut_short:
+                out.notes.append(
+                    f"{row.arm} rep {row.rep}: {cut_short} attempt(s) were cut short by a "
+                    f"policy check -- the log accounts for {steps} step(s) and "
+                    f"{counts['failure']} failure(s) for this repetition"
+                )
 
             # the event log is the truth about what happened
             if row.l1_failures != counts["failure"]:
@@ -337,6 +373,23 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
                         f"{row.arm} rep {row.rep}: report says {row.l1_failures} failure(s) "
                         f"(old, deduplicated count), the event log has {counts['failure']} "
                         f"failing check(s) -- the column is not re-derivable for old reports"
+                    )
+            if cut_short and row.total_steps != steps:
+                # the report cannot have counted the cut-short attempt
+                detail = (
+                    f"{counts['action']} action(s) + {counts['invalid_action']} invalid "
+                    f"+ {cut_short} cut short"
+                )
+                if row.invalid >= 0:
+                    out.mismatches.append(
+                        f"{row.arm} rep {row.rep}: event log accounts for {steps} step(s) "
+                        f"({detail}), report says {row.total_steps}"
+                    )
+                else:
+                    out.notes.append(
+                        f"{row.arm} rep {row.rep}: report says {row.total_steps} step(s), the "
+                        f"event log accounts for {steps} ({detail}) -- the attempt that a "
+                        "policy check cut short is in the log but not in the report"
                     )
             if row.invalid >= 0 and counts["invalid_action"] != row.invalid:
                 out.mismatches.append(
@@ -409,7 +462,11 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
             summary.steps_to_pass += row.steps_to_pass
             summary.tokens_to_pass += row.tokens_to_pass
             summary.total_tokens += row.tokens
-            summary.l1_failures += row.l1_failures
+            # the failure count comes from the log, not from the report: the
+            # log is where the failures happened, and a report that dropped
+            # an attempt counts fewer of them than the log records
+            counts = out.log_counts.get((label, row.rep))
+            summary.l1_failures += counts["failure"] if counts else row.l1_failures
             summary.hidden_looks += stats.hidden_looks
             summary.prompts += row.prompts_total_lesson or row.prompts_total_facts
             summary.prompts_with_lesson += row.prompts_with_lesson

@@ -4,7 +4,7 @@
 
 ```bash
 python -m planloop demo      # 四组对照实验，约 20 秒
-python -m unittest discover -s tests -t .   # 285 项测试
+python -m unittest discover -s tests -t .   # 297 项测试
 ```
 
 核心主张只有一句：**在「模型自己宣布完成、但其实不算完成」的那一类失效上，主因不是规划器不够聪明，而是计划不可验证。** 所以这个项目把力气花在"验收、记忆、回滚"上，而不是提示词。
@@ -117,7 +117,7 @@ PLANLOOP_API_KEY=...
 
 ```
 planloop/          运行时（纯标准库，无第三方依赖）
-tests/             285 项单测（unittest，pytest 亦可跑）
+tests/             297 项单测（unittest，pytest 亦可跑）
 docs/              设计文档，已实现与仅设计分开标注
 examples/          可跑的 spec 示例
 ```

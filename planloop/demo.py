@@ -319,9 +319,11 @@ def run_demo(base: Path, *, quiet: bool = False) -> dict[str, Any]:
             log_path=base / f"events_{label}.jsonl",
         )
         guard = bool(result.compile_report and result.compile_report.injections)
-        failures = sum(len(o.failures) for o in result.outcomes)
-        catches = sum(1 for o in result.outcomes for f in o.failures if f.get("guard_only"))
-        steps = sum(o.steps for o in result.outcomes)
+        # every attempt that ran, including the ones a policy check cut short
+        attempts = list(result.outcomes) + list(getattr(result, "interrupted", []))
+        failures = sum(len(o.failures) for o in attempts)
+        catches = sum(1 for o in attempts for f in o.failures if f.get("guard_only"))
+        steps = sum(o.steps for o in attempts)
         rec = DemoRecord(label, result, suite_green(ws), guard, catches, failures, steps)
         records.append(rec)
         if not quiet:

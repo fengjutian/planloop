@@ -775,11 +775,16 @@ def _prepare_oracle(base: Path, name: str, source: str) -> str:
 
 def _measure(result: RunResult, spy: Spy, repo: Path, *, guard_injected: bool,
              verdict_green: bool | None = None, tampered: bool) -> ArmResult:
-    steps = sum(o.steps for o in result.outcomes)
-    to_pass = sum(o.steps_to_pass for o in result.outcomes)
-    tok_to_pass = sum(o.tokens_to_pass for o in result.outcomes)
-    failures = sum(o.l1_failures for o in result.outcomes)
-    catches = sum(1 for o in result.outcomes for f in o.failures if f.get("guard_only"))
+    # Every attempt that ran -- including the ones a policy check cut short.
+    # They spent the steps and they recorded the failures, and the event log
+    # has both; an attempt that is not counted here is a number the log and
+    # the report disagree about (2026-11-12: the fifteenth defect).
+    attempts = list(result.outcomes) + list(getattr(result, "interrupted", []))
+    steps = sum(o.steps for o in attempts)
+    to_pass = sum(o.steps_to_pass for o in attempts)
+    tok_to_pass = sum(o.tokens_to_pass for o in attempts)
+    failures = sum(o.l1_failures for o in attempts)
+    catches = sum(1 for o in attempts for f in o.failures if f.get("guard_only"))
     usage = result.usage or {}
     suite_green = demo.suite_green(repo)
     total_tokens = int(usage.get("tokens", 0) or 0)

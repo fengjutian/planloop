@@ -31,7 +31,7 @@ from planloop.membench import (
     analyze_events,
     run_membench,
 )
-from planloop.membench_verify import recompute
+from planloop.membench_verify import format_report, recompute
 
 
 class MemoryValueTest(unittest.TestCase):
@@ -393,6 +393,7 @@ class ModelFailureTest(unittest.TestCase):
             status = "blocked"
             duration_s = 0.0
             outcomes = []
+            interrupted = []
             compile_report = None
 
         _Result.usage = usage
@@ -566,3 +567,153 @@ class VerifyTest(unittest.TestCase):
             summary = result.summaries["R2_none"]
             self.assertEqual(summary.hidden_looks, 1,
                              "the hidden contract was read once in the event log")
+
+    # -- an attempt that a policy check cut short -------------------------
+    # 2026-11-12: a real run had its second attempt stopped by the risk
+    # policy.  The attempt was dropped, so the report counted fewer steps
+    # and fewer failures than the event log recorded -- and the gate said
+    # nothing about it, because the gate only compared one column.
+
+    def _dropped_attempt_events(self) -> list[dict]:
+        return [
+            {"kind": "node_start", "data": {"attempt": 1}},
+            {"kind": "failure", "data": {"reason": "boom"}},
+            {"kind": "node_end", "data": {"status": "failed", "steps": 1}},
+            {"kind": "node_start", "data": {"attempt": 2}},
+            {"kind": "failure", "data": {"reason": "boom again"}},
+            {"kind": "action", "data": {"action": "read", "target": "a.py"}},
+            {"kind": "approval_requested", "data": {"rule": "subshell"}},
+        ]
+
+    def _dropped_attempt_row(self) -> dict:
+        return {
+            "rep": 1, "arm": "R2_none", "status": "blocked", "steps_to_pass": 0,
+            "tokens_to_pass": 0, "total_steps": 1, "model_calls": 20, "tokens": 1000,
+            "l1_failures": 1, "guard_catches": 0, "prompts_lesson": "0/20",
+            "prompts_facts": "0/20", "verdict": "红", "suite": "绿",
+        }
+
+    def test_a_dropped_attempt_is_flagged_with_its_cause(self):
+        """The report counts less than the log -> the gate must say so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(
+                tmp, [self._dropped_attempt_row()], {"R2_none_1": self._dropped_attempt_events()}
+            )
+            result = recompute(run_dir, report, FEE_FAMILY)
+        joined = " ".join(result.mismatches)
+        self.assertTrue(result.mismatches, "the dropped attempt was accepted silently")
+        self.assertIn("2 failure(s)", joined, "the log's failure count must be named")
+        self.assertIn("2 step(s)", joined, "the log's step count must be named")
+
+    def test_the_cut_short_attempt_is_explained_not_just_counted(self):
+        """Every note has to say *why* the two books differ."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(
+                tmp, [self._dropped_attempt_row()], {"R2_none_1": self._dropped_attempt_events()}
+            )
+            result = recompute(run_dir, report, FEE_FAMILY)
+        notes = " ".join(result.notes)
+        self.assertIn("cut short", notes)
+        self.assertIn("policy check", notes)
+
+    def test_the_failure_count_comes_from_the_log_not_the_report(self):
+        """The aggregate is quoted in the document -- so it is the log's number."""
+        rows = [self._dropped_attempt_row()]
+        for arm in ("R2_memory", "R2_fact"):
+            rows.append({
+                "rep": 1, "arm": arm, "status": "succeeded", "steps_to_pass": 2,
+                "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+                "l1_failures": 1, "guard_catches": 0, "prompts_lesson": "0/12",
+                "prompts_facts": "0/12", "verdict": "绿", "suite": "绿",
+            })
+        events = {"R2_none_1": self._dropped_attempt_events()}
+        for arm in ("R2_memory", "R2_fact"):
+            events[f"{arm}_1"] = [
+                {"kind": "failure", "data": {"reason": "boom"}},
+                self._action("a.py"),
+            ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+        self.assertEqual(result.summaries["R2_none"].l1_failures, 2,
+                         "the log has two failures; the report only counted one")
+
+    # -- the noise floor ---------------------------------------------------
+
+    def _three_arms(self, rep: int, with_lesson: int) -> tuple[list[dict], dict[str, list[dict]]]:
+        rows = []
+        events = {}
+        for arm in ("R2_none", "R2_memory", "R2_fact"):
+            rows.append({
+                "rep": rep, "arm": arm, "status": "succeeded", "steps_to_pass": 2,
+                "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+                "l1_failures": 1, "guard_catches": 0,
+                "prompts_lesson": f"{with_lesson}/12" if arm == "R2_memory" else "0/12",
+                "prompts_facts": "12/12" if arm == "R2_fact" else "0/12",
+                "verdict": "绿", "suite": "绿",
+            })
+            events[f"{arm}_{rep}"] = [self._action("shop/helpers.py")]
+        return rows, events
+
+    def test_the_noise_floor_uses_the_reps_that_carried_no_lesson(self):
+        """The floor is the A/A comparison: both arms ran the same prompt."""
+        rows, events = [], {}
+        r1, e1 = self._three_arms(1, 0)     # no lesson to carry -> identical prompts
+        r2, e2 = self._three_arms(2, 5)     # a lesson was carried -> not a floor
+        rows += r1 + r2
+        events.update(e1)
+        events.update(e2)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+        self.assertEqual(result.lesson_paired_reps, [2])
+        self.assertEqual(result.noise_floor["reps"], [1],
+                         "the floor is the repetition where neither arm carried a lesson")
+
+    def test_a_run_with_no_silent_repetition_says_it_has_no_floor(self):
+        """No floor is not a floor of zero -- the report has to say so."""
+        rows, events = self._three_arms(1, 5)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            text = format_report(result)
+        self.assertFalse(result.noise_floor)
+        self.assertIn("NO NOISE FLOOR", text)
+        self.assertNotIn("NOISE FLOOR (", text)
+
+    def test_the_floor_is_printed_with_the_numbers_it_stands_on(self):
+        rows, events = self._three_arms(1, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+            text = format_report(result)
+        self.assertIn("NOISE FLOOR", text)
+        self.assertIn("model's own variance", text)
+
+    # -- the wasted steps --------------------------------------------------
+
+    def test_the_invalid_reply_column_is_cross_checked_against_the_log(self):
+        """The column of unparsable replies must be re-derivable."""
+        rows = [{
+            "rep": 1, "arm": "R2_none", "status": "succeeded", "steps_to_pass": 2,
+            "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12, "tokens": 1000,
+            "l1_failures": 1, "guard_catches": 0, "invalid": 0, "prompts_lesson": "0/12",
+            "prompts_facts": "0/12", "verdict": "绿", "suite": "绿",
+        }]
+        events = {"R2_none_1": [
+            {"kind": "invalid_action", "data": {"raw": "thinking out loud"}},
+            self._action("a.py"),
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+        joined = " ".join(result.mismatches)
+        self.assertTrue(result.mismatches, "the wasted step was not cross-checked")
+        self.assertIn("invalid_action", joined)

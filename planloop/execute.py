@@ -18,6 +18,7 @@ from planloop.budget import BudgetExceeded, Ledger
 from planloop.decomp import Plan, TaskNode
 from planloop.memory import MemoryContext, MemoryStore, signature
 from planloop.model import Model, extract_json
+from planloop.policy import DeniedAction, NeedsApproval
 from planloop.spec import Limits
 from planloop.tools import Observation, ToolError, Tools
 from planloop.verify import VerificationReport, Verifier
@@ -216,6 +217,36 @@ class Executor:
         return self.verifier.l1_only(node.acceptance, evidence=evidence)
 
     # -- main -------------------------------------------------------------
+    def _interrupt(self, outcome: NodeOutcome, node: TaskNode, exc: Exception) -> None:
+        """Close an attempt that a policy check cut short.
+
+        The attempt did real work -- it spent steps and it recorded L1
+        failures, and both are in the event log -- but the exception leaves
+        ``run()`` before an outcome is returned.  The caller used to drop the
+        whole attempt on the floor, and then the report counted fewer steps
+        and fewer failures than the log records (12 steps vs 19 actions, 1 vs
+        2 failures, in the run that exposed this).
+
+        So the attempt is closed in the log (``node_end`` with the status
+        ``interrupted``) and the partial outcome travels on the exception, so
+        the caller can record it.  The run stays blocked exactly as before --
+        only the *measurement* stops losing the attempt.
+        """
+        outcome.status = "interrupted"
+        outcome.last_error = outcome.last_error or str(exc)
+        self.bb.append(
+            "node_end",
+            node.id,
+            status="interrupted",
+            steps=outcome.steps,
+            tokens=round(outcome.tokens),
+            reason=str(exc)[:200],
+        )
+        try:
+            exc.outcome = outcome  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover - an exception without __dict__
+            pass
+
     def run(self, node: TaskNode, plan: Plan, *, extra_context: str = "") -> NodeOutcome:
         outcome = NodeOutcome(node_id=node.id)
         self.tools.node_id = node.id
@@ -317,6 +348,16 @@ class Executor:
                 # let the model correct itself. Escaping here killed the whole
                 # run -- one stray action could throw away a long task.
                 obs = Observation(kind or "action", False, 2, "", str(exc))
+            except (NeedsApproval, DeniedAction, BudgetExceeded) as exc:
+                # A policy check (or the budget) cut this attempt short.  The
+                # work it already did is real and it is in the event log, but
+                # the attempt never returns an outcome -- so it used to be
+                # dropped, and the report then counted fewer steps and fewer
+                # L1 failures than the log records.  Close the attempt in the
+                # log, keep the partial outcome on the exception, and let the
+                # caller record it.
+                self._interrupt(outcome, node, exc)
+                raise
 
             self.bb.record_observation(node.id, obs.render())
             self.bb.append("action", node.id, action=kind, target=target,
