@@ -48,7 +48,7 @@ from planloop import demo
 from planloop import heldout
 from planloop.memdb import MemorySystem
 from planloop.memory import MemoryStore
-from planloop.scheduler import RunResult, run
+from planloop.scheduler import RunResult, all_attempts, run
 from planloop.spec import ProblemSpec
 
 FULL_SUITE = demo.FULL_SUITE
@@ -121,6 +121,19 @@ class Family:
     #: claim "the memory arm skipped the lookup" checkable instead of
     #: asserted.
     hidden_markers: list[str] = field(default_factory=list)
+    #: the solution a model could **guess** without reading the contract: the
+    #: files it writes.  The oracle has to reject it -- otherwise the
+    #: knowledge was never necessary and the measurement measures nothing.
+    #: That is exactly what the contract family did (its visible test pins
+    #: the 10% row, so ``1 - p/100`` guesses the 20% row too), and it is why
+    #: that whole run had to be withdrawn.
+    guessable_solution: dict[str, str] = field(default_factory=dict)
+    #: whether the oracle rejects :attr:`guessable_solution`.  ``False``
+    #: marks the family as **not a device**: nothing may be published from it.
+    shortcut_rejected: bool = True
+    #: why the knowledge is (or is not) necessary, in one sentence.  A family
+    #: that does not say this has not thought about its own device.
+    device_note: str = ""
     #: per-task overrides: the files the prompt carries.  A task can leave a
     #: file **out** on purpose -- then the model has to open it to learn its
     #: contract, and a memory that already carries the contract saves it a
@@ -281,6 +294,15 @@ class FinalTest(unittest.TestCase):
         self.assertEqual(total([100, 200], 10), 270)
 '''
 
+#: the solution a model could guess without reading the contract: the
+#: obvious formula.  Whether the oracle rejects it is what decides whether
+#: the family's knowledge is necessary at all.
+NAIVE_TOTAL = (
+    "def total(prices, discount_pct, member_pct=0):\n"
+    "    subtotal = sum(prices)\n"
+    "    return subtotal * (1 - discount_pct / 100) * (1 - member_pct / 100)\n"
+)
+
 CONTRACT_FAMILY = Family(
     name="contract",
     initial={
@@ -327,6 +349,17 @@ CONTRACT_FAMILY = Family(
     # has to open the file -- and a memory that carries it does not.
     r2_context_files=["shop/pricing.py", "tests/test_pricing.py"],
     hidden_markers=["def pct("],
+    guessable_solution={"shop/pricing.py": NAIVE_TOTAL},
+    #: the visible test pins ``total([100, 200], 10) == 270``, so ``1 - p/100``
+    #: guesses the 20% row as well -- and the oracle **accepts** it.  The
+    #: knowledge was never necessary, so this family measured nothing and its
+    #: run was withdrawn.  It stays in the code for the record.
+    shortcut_rejected=False,
+    device_note=(
+        "not a device: the visible test pins the 10% row, so the obvious formula "
+        "1-p/100 guesses the 20% row too and the oracle accepts it -- the "
+        "knowledge was never necessary (the run was withdrawn)"
+    ),
     limits={"max_attempts_per_node": 2, "max_steps_per_node": 12},
 )
 
@@ -505,6 +538,13 @@ FEE_FAMILY = Family(
     # device; the device can only *report* it.
     r2_context_files=["shop/pricing.py", "tests/test_pricing.py"],
     hidden_markers=["def pct("],
+    guessable_solution={"shop/pricing.py": NAIVE_TOTAL},
+    shortcut_rejected=True,
+    device_note=(
+        "the platform fee depends on the discount tier, so 1-p/100 guesses the "
+        "20% row wrong (0.8 vs 0.75) -- the oracle rejects it, so the knowledge "
+        "is necessary and a lookup is a real action"
+    ),
     fact_key="shop/pricing.py.pct_surcharge",
     fact_value=(
         "shop/helpers.py 的 pct(value) = 1 - value/100 - surcharge(value)；"
@@ -513,6 +553,13 @@ FEE_FAMILY = Family(
     ),
     limits={"max_attempts_per_node": 2, "max_steps_per_node": 12},
 )
+
+#: the families whose measurements may be published.  A family qualifies only
+#: when its knowledge is **necessary** -- when the oracle rejects the
+#: shortcut a model could guess.  The contract family failed that, and its
+#: whole run had to be withdrawn: "not measured" had really meant "the device
+#: measured nothing".  A new family has to earn its place here.
+PUBLISHABLE_FAMILIES = ("fee",)
 
 
 @dataclass
@@ -779,7 +826,7 @@ def _measure(result: RunResult, spy: Spy, repo: Path, *, guard_injected: bool,
     # They spent the steps and they recorded the failures, and the event log
     # has both; an attempt that is not counted here is a number the log and
     # the report disagree about (2026-11-12: the fifteenth defect).
-    attempts = list(result.outcomes) + list(getattr(result, "interrupted", []))
+    attempts = all_attempts(result)
     steps = sum(o.steps for o in attempts)
     to_pass = sum(o.steps_to_pass for o in attempts)
     tok_to_pass = sum(o.tokens_to_pass for o in attempts)

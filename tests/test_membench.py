@@ -24,6 +24,7 @@ from planloop.membench import (
     CONTRACT_FAMILY,
     FACT_KEY,
     FEE_FAMILY,
+    PUBLISHABLE_FAMILIES,
     Spy,
     _build_specs,
     _oracle_green,
@@ -31,7 +32,8 @@ from planloop.membench import (
     analyze_events,
     run_membench,
 )
-from planloop.membench_verify import format_report, recompute
+from planloop.membench_publish import check_behaviour, check_floor, check_published, rebuild
+from planloop.membench_verify import format_report, parse_report, recompute
 
 
 class MemoryValueTest(unittest.TestCase):
@@ -377,6 +379,134 @@ class FeeFamilyTest(unittest.TestCase):
         )
 
 
+class FamilyDeviceTest(unittest.TestCase):
+    """Every family must prove that its knowledge is **necessary**.
+
+    2026-11-11: the contract family's contract could be guessed from the
+    visible test (``1 - p/100`` gets both rows right), so the memory had
+    nothing to save -- the whole run measured nothing and had to be
+    withdrawn.  The fee family fixed that by pinning one row of a tier
+    table.
+
+    So every family now ships the **shortcut a model could guess** and has to
+    prove that the held-out oracle rejects it.  A family that cannot is not
+    a device, and nothing may be published from it.
+    """
+
+    FAMILIES = {"fee": FEE_FAMILY, "contract": CONTRACT_FAMILY}
+
+    def _shortcut_is_rejected(self, fam) -> bool:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo = base / "repo"
+            repo.mkdir()
+            _reset_repo(repo, fam)
+            for path, content in fam.guessable_solution.items():
+                (repo / path).write_text(content, encoding="utf-8")
+            return not _oracle_green(fam.r2_oracle, repo)
+
+    def test_every_family_declares_its_shortcut_and_why(self):
+        for name, fam in self.FAMILIES.items():
+            self.assertTrue(fam.guessable_solution,
+                            f"{name} declares no guessable shortcut -- so nobody has "
+                            f"checked whether its knowledge is necessary")
+            self.assertTrue(fam.device_note,
+                            f"{name} does not say why its knowledge is necessary")
+
+    def test_the_oracle_says_the_same_thing_as_the_family(self):
+        for name, fam in self.FAMILIES.items():
+            rejected = self._shortcut_is_rejected(fam)
+            self.assertEqual(
+                rejected, fam.shortcut_rejected,
+                f"{name}: the oracle {'rejects' if rejected else 'accepts'} the "
+                f"guessable shortcut, but the family says the opposite",
+            )
+
+    def test_only_a_family_with_a_necessary_knowledge_may_be_published(self):
+        for name in PUBLISHABLE_FAMILIES:
+            fam = self.FAMILIES[name]
+            self.assertTrue(
+                fam.shortcut_rejected,
+                f"{name} may not be published: its knowledge is not necessary, so the "
+                f"measurement would be measuring nothing",
+            )
+
+    def test_the_known_bad_family_still_says_why_it_is_bad(self):
+        """The withdrawn family stays in the code -- with the reason attached."""
+        fam = self.FAMILIES["contract"]
+        self.assertFalse(fam.shortcut_rejected)
+        self.assertIn("never necessary", fam.device_note)
+
+
+class ReportFormatTest(unittest.TestCase):
+    """The report generator and the gate's parser must speak the same format.
+
+    The gate reads the machine report's per-rep table and compares it with
+    the event logs.  If the two drift apart -- a column added on one side
+    only -- the gate either stops checking anything or starts checking the
+    wrong numbers.  The report has **two** tables of the same width, so the
+    parser has to know which one is the per-rep table.
+    """
+
+    def _arm(self, **kw) -> "ArmResult":
+        from planloop.membench import ArmResult
+
+        base = dict(
+            label="R2_none", arm="no_memory", rep=1, status="succeeded",
+            steps=12, steps_to_pass=2, tokens_to_pass=100, model_calls=12, tokens=1000,
+            l1_failures=3, guard_catches=0, guard_injected=False, prompts=12,
+            prompts_with_lesson=4, prompts_with_facts=0, suite_green_after=True,
+            verdict_green=True, tampered=False, duration_s=1.0, invalid=2,
+        )
+        base.update(kw)
+        return ArmResult(**base)
+
+    def _report_text(self) -> str:
+        from planloop.membench import MemBenchResult, to_markdown
+
+        return to_markdown(MemBenchResult(mode="real", reps=1, family="fee",
+                                          arms=[self._arm()]))
+
+    def test_the_generated_report_can_be_read_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text(self._report_text(), encoding="utf-8")
+            rows = parse_report(path)
+        self.assertEqual(len(rows), 1, "the per-rep table was not found")
+        row = rows[0]
+        self.assertEqual(row.arm, "R2_none")
+        self.assertEqual(row.l1_failures, 3)
+        self.assertEqual(row.invalid, 2, "the wasted-replies column must survive")
+        self.assertEqual(row.prompts_with_lesson, 4)
+        self.assertEqual(row.total_steps, 12)
+
+    def test_the_summary_table_is_not_read_as_repetitions(self):
+        """Both tables have the same width; only one of them is per-rep."""
+        summary = ("| 臂 | n | 绿 | 步数 | tokens | 总步数 | 总 tokens | L1 | 护栏 | "
+                   "无效回复 | 带教训 | 带事实 | 判定 | 全量 | 备注 |\n"
+                   "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+                   "| 1 | R2_none | 1/1 | 3.0 | 100 | 12 | 1000 | 3 | 0 | 2 | 4/12 | 0/12 |"
+                   " 绿 | 绿 | x |\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.md"
+            path.write_text(summary + self._report_text(), encoding="utf-8")
+            rows = parse_report(path)
+        self.assertEqual(len(rows), 1, "the summary row was read as a repetition")
+        self.assertEqual(rows[0].rep, 1)
+
+    def test_a_report_without_a_per_rep_table_is_flagged(self):
+        """A gate that cannot read the report must not report success."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = tmp / "report.md"
+            path.write_text("# 一份没有逐次表的报告\n\n什么都没有。\n", encoding="utf-8")
+            run_dir = tmp / "run"
+            run_dir.mkdir()
+            result = recompute(run_dir, path, FEE_FAMILY)
+        self.assertTrue(result.mismatches, "an unreadable report passed the gate")
+        self.assertIn("no per-rep table", result.mismatches[0])
+
+
 class ModelFailureTest(unittest.TestCase):
     """A run whose model never answered is a **broken harness**, not a failed task.
 
@@ -548,6 +678,36 @@ class VerifyTest(unittest.TestCase):
             self.assertTrue(result.notes)
             self.assertIn("R2_none rep 1", result.notes[0])
 
+    def test_the_floor_percentage_is_computed_from_the_unrounded_means(self):
+        """Rounding the means first turned a 50% floor into 48%.
+
+        The floor is a headline number, and on the real run the means were
+        2.667 and 4.0 -- rounded to 2.7 and 4.0 the percentage came out two
+        points low.  The rounding is for *display*; the percentage has to be
+        computed from the raw means.
+        """
+        rows = []
+        events = {}
+        for rep, steps in ((1, (3, 8)), (2, (3, 2)), (3, (2, 2))):
+            for arm, value in (("R2_none", steps[0]), ("R2_memory", steps[1]),
+                               ("R2_fact", 2)):
+                rows.append({
+                    "rep": rep, "arm": arm, "status": "succeeded", "steps_to_pass": value,
+                    "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12,
+                    "tokens": 1000, "l1_failures": 1, "guard_catches": 0,
+                    "prompts_lesson": "0/12", "prompts_facts": "0/12",
+                    "verdict": "绿", "suite": "绿",
+                })
+                events[f"{arm}_{rep}"] = [
+                    {"kind": "action", "data": {"action": "read", "target": "a.py"}},
+                ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            result = recompute(run_dir, report, FEE_FAMILY)
+        self.assertEqual(result.noise_floor["steps_delta_pct"], "50%",
+                         "the floor must come from the unrounded means")
+
     def test_the_hidden_looks_come_from_the_event_log_not_the_report(self):
         """Behaviour is re-derived, never copied from the report."""
         rows = [{
@@ -717,3 +877,299 @@ class VerifyTest(unittest.TestCase):
         joined = " ".join(result.mismatches)
         self.assertTrue(result.mismatches, "the wasted step was not cross-checked")
         self.assertIn("invalid_action", joined)
+
+
+class PublishedTableTest(unittest.TestCase):
+    """The published table must be the table the logs rebuild -- cell for cell.
+
+    2026-11-12: the document quoted a machine report that had dropped an
+    attempt the risk policy cut short, so two cells were smaller than the
+    event log says.  The numbers are now rebuilt from the log
+    (``planloop.membench_publish``) -- and this checks that the rebuild and
+    the document agree, so a hand-edited cell cannot survive.
+    """
+
+    def _fixture(self, tmp: Path, rows: list[dict], events: dict[str, list[dict]]):
+        run_dir = tmp / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        header = ("| rep | 臂 | 状态 | steps2pass | tok2pass | 总步数 | 模型调用 | 总 tokens | "
+                  "L1 失败 | 护栏拦截 | 无效回复 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
+        lines = [header, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for row in rows:
+            cells = [str(row[c]) for c in (
+                "rep", "arm", "status", "steps_to_pass", "tokens_to_pass", "total_steps",
+                "model_calls", "tokens", "l1_failures", "guard_catches")]
+            cells.append(str(row.get("invalid", 0)))
+            cells += [str(row[c]) for c in (
+                "prompts_lesson", "prompts_facts", "verdict", "suite")]
+            lines.append("| " + " | ".join(cells) + " |")
+        report = tmp / "report.md"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for name, records in events.items():
+            (run_dir / f"events_{name}.jsonl").write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+                encoding="utf-8",
+            )
+        return run_dir, report
+
+    def _dropped(self) -> tuple[list[dict], dict[str, list[dict]]]:
+        rows = [{
+            "rep": 1, "arm": "R2_none", "status": "blocked", "steps_to_pass": 0,
+            "tokens_to_pass": 0, "total_steps": 1, "model_calls": 20, "tokens": 1000,
+            "l1_failures": 1, "guard_catches": 0, "prompts_lesson": "0/20",
+            "prompts_facts": "0/20", "verdict": "红", "suite": "绿",
+        }]
+        events = {"R2_none_1": [
+            {"kind": "node_start", "data": {"attempt": 1}},
+            {"kind": "failure", "data": {"reason": "boom"}},
+            {"kind": "node_end", "data": {"status": "failed", "steps": 1}},
+            {"kind": "node_start", "data": {"attempt": 2}},
+            {"kind": "failure", "data": {"reason": "boom again"}},
+            {"kind": "action", "data": {"action": "read", "target": "a.py"}},
+            {"kind": "approval_requested", "data": {"rule": "subshell"}},
+        ]}
+        return rows, events
+
+    def test_the_rebuild_uses_the_log_not_the_report(self):
+        rows, events = self._dropped()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            table, changed = rebuild(run_dir, report)
+        self.assertIn("| 1 | R2_none | blocked | 0 | 0 | 2 | 1000 | 2 | 0/20 | 0/20 | 红 | 绿 |",
+                      table[0])
+        self.assertEqual(len(changed), 2, changed)
+
+    def test_a_document_that_matches_the_rebuild_passes(self):
+        rows, events = self._dropped()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            table, _ = rebuild(run_dir, report)
+            doc = tmp / "doc.md"
+            doc.write_text("\n".join(table) + "\n", encoding="utf-8")
+            problems = check_published(doc, run_dir, report)
+        self.assertEqual(problems, [])
+
+    def test_a_hand_edited_cell_is_caught(self):
+        """The point of the check: a number typed in by hand must not survive."""
+        rows, events = self._dropped()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp, rows, events)
+            table, _ = rebuild(run_dir, report)
+            doc = tmp / "doc.md"
+            doc.write_text("\n".join(table) + "\n", encoding="utf-8")
+            # now "fix" the row by hand, back to the machine report's numbers
+            doc.write_text(doc.read_text(encoding="utf-8").replace(
+                "| 1 | R2_none | blocked | 0 | 0 | 2 | 1000 | 2 |",
+                "| 1 | R2_none | blocked | 0 | 0 | 1 | 1000 | 1 |",
+            ), encoding="utf-8")
+            problems = check_published(doc, run_dir, report)
+        self.assertTrue(problems, "a hand-edited cell passed the check")
+        self.assertIn("rebuilt", problems[0])
+
+    # -- the behaviour table (the headline effect) -------------------------
+
+    def _behaviour_fixture(self, tmp: Path):
+        """8 reps x 3 arms: the control arm looks the price table up `rep` times."""
+        rows: list[dict] = []
+        events: dict[str, list[dict]] = {}
+        for rep in range(1, 9):
+            for arm in ("R2_none", "R2_memory", "R2_fact"):
+                rows.append({
+                    "rep": rep, "arm": arm, "status": "succeeded", "steps_to_pass": 2,
+                    "tokens_to_pass": 100, "total_steps": 12, "model_calls": 12,
+                    "tokens": 1000, "l1_failures": 1, "guard_catches": 0,
+                    "prompts_lesson": "0/12", "prompts_facts": "0/12",
+                    "verdict": "绿", "suite": "绿",
+                })
+                looks = rep if arm == "R2_none" else 0
+                events[f"{arm}_{rep}"] = [
+                    {"kind": "action", "data": {
+                        "action": "read", "target": "shop/helpers.py",
+                        "detail": "def pct(value): ...",
+                    }}
+                    for _ in range(looks)
+                ]
+        return self._fixture(tmp, rows, events)
+
+    def _behaviour_doc(self, wrong: str = "") -> str:
+        lines = ["| rep | 对照臂 查表/第一步 | 教训臂 查表/第一步 | 事实臂 查表/第一步 |",
+                 "|---|---|---|---|"]
+        for rep in range(1, 9):
+            first = str(rep)
+            if wrong and int(wrong) == rep:
+                first = str(rep + 1)
+            lines.append(f"| {rep} | {first} / read shop/helpers.py | 0 / read x | 0 / read x |")
+        lines.append("| **合计** | **36** | 0 | 0 |")
+        return "\n".join(lines) + "\n"
+
+    def test_the_behaviour_table_matches_the_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._behaviour_fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._behaviour_doc(), encoding="utf-8")
+            problems = check_behaviour(doc, run_dir)
+        self.assertEqual(problems, [])
+
+    def test_a_hand_edited_behaviour_cell_is_caught(self):
+        """The headline effect ("half as many lookups") is read back by hand here."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._behaviour_fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._behaviour_doc(wrong="3"), encoding="utf-8")
+            problems = check_behaviour(doc, run_dir)
+        self.assertTrue(problems, "a hand-edited lookup count passed the check")
+        self.assertIn("rep 3", problems[0])
+
+
+class FloorLintTest(unittest.TestCase):
+    """An effect inside the noise floor must not be published as a win.
+
+    2026-11-11: a run claimed "-45% tokens" and nobody had measured how far
+    two arms running **the same prompt** already differ -- the effect was
+    inside the noise, and the number had to be withdrawn (fee9).  The gate
+    computes the floor; this checks that the **document** uses it the same
+    way.
+    """
+
+    #: steps / tokens / hidden-lookups per arm per repetition
+    #: rep 1 is a *silent* repetition (the lesson arm carried no lesson, so
+    #: both arms ran the same prompt) -- that is where the floor comes from.
+    VALUES = {
+        "R2_none": {"steps": [4, 3], "tokens": [100, 100], "hidden": [5, 5]},
+        "R2_memory": {"steps": [6, 5], "tokens": [140, 130], "hidden": [6, 6]},
+        "R2_fact": {"steps": [2, 2], "tokens": [70, 70], "hidden": [3, 3]},
+    }
+
+    def _fixture(self, tmp: Path):
+        rows: list[dict] = []
+        events: dict[str, list[dict]] = {}
+        for rep in (1, 2):
+            for arm, values in self.VALUES.items():
+                rows.append({
+                    "rep": rep, "arm": arm, "status": "succeeded",
+                    "steps_to_pass": values["steps"][rep - 1],
+                    "tokens_to_pass": values["tokens"][rep - 1],
+                    "total_steps": 12, "model_calls": 12, "tokens": 1000,
+                    "l1_failures": 1, "guard_catches": 0,
+                    "prompts_lesson": ("5/12" if arm == "R2_memory" and rep == 2 else "0/12"),
+                    "prompts_facts": "12/12" if arm == "R2_fact" else "0/12",
+                    "verdict": "绿", "suite": "绿",
+                })
+                events[f"{arm}_{rep}"] = [
+                    {"kind": "action", "data": {
+                        "action": "read", "target": "shop/helpers.py",
+                        "detail": "def pct(value): ...",
+                    }}
+                    for _ in range(values["hidden"][rep - 1])
+                ]
+        return self._fixture_rows(tmp, rows, events)
+
+    def _fixture_rows(self, tmp: Path, rows: list[dict], events: dict[str, list[dict]]):
+        run_dir = tmp / "run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        header = ("| rep | 臂 | 状态 | steps2pass | tok2pass | 总步数 | 模型调用 | 总 tokens | "
+                  "L1 失败 | 护栏拦截 | 无效回复 | 带教训 | 带事实 | 外部判定 | 全量测试 |")
+        lines = [header, "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+        for row in rows:
+            cells = [str(row[c]) for c in (
+                "rep", "arm", "status", "steps_to_pass", "tokens_to_pass", "total_steps",
+                "model_calls", "tokens", "l1_failures", "guard_catches")]
+            cells.append(str(row.get("invalid", 0)))
+            cells += [str(row[c]) for c in (
+                "prompts_lesson", "prompts_facts", "verdict", "suite")]
+            lines.append("| " + " | ".join(cells) + " |")
+        report = tmp / "report.md"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        for name, records in events.items():
+            (run_dir / f"events_{name}.jsonl").write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n",
+                encoding="utf-8",
+            )
+        return run_dir, report
+
+    def _doc(self, steps_verdict: str) -> str:
+        return (
+            "| 同 prompt 的两臂 | 步数 | tokens | 查表 |\n"
+            "|---|---|---|---|\n"
+            "| 差 | **+50%** | **+40%** | **+20%** |\n"
+            "\n"
+            "| 口径 | 对照 → 事实臂 | 相对噪声地板 |\n"
+            "|---|---|---|\n"
+            "| 到验收通过的步数 | 3.5 → 2.0（-43%） | " + steps_verdict + " |\n"
+            "| 到验收通过的 tokens | 100 → 70（-30%） | ❌ 落在地板（±40%）内 |\n"
+            "| 总 tokens | 1000 → 1000（0%） | ❌ 落在地板内 |\n"
+            "| **查档位表次数** | **5 → 3（-40%）** | ✅ **在噪声之上** |\n"
+        )
+
+    def test_a_correct_effect_table_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._doc("❌ 落在地板（±50%）内"), encoding="utf-8")
+            problems = check_floor(doc, run_dir, report)
+        self.assertEqual(problems, [])
+
+    def test_an_effect_inside_the_floor_cannot_be_published_as_a_win(self):
+        """This is the fee9 mistake, mechanised."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._doc("✅ **在噪声之上**"), encoding="utf-8")
+            problems = check_floor(doc, run_dir, report)
+        self.assertTrue(problems, "an effect inside the noise floor passed the check")
+        self.assertTrue(any("noise floor" in p for p in problems), problems)
+
+    def test_an_effect_that_is_not_the_recomputed_one_is_caught(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._doc("❌ 落在地板（±50%）内").replace(
+                "3.5 → 2.0（-43%）", "3.5 → 2.0（-99%）"), encoding="utf-8")
+            problems = check_floor(doc, run_dir, report)
+        self.assertTrue(problems, "a mis-stated effect passed the check")
+        self.assertTrue(any("-43%" in p for p in problems), problems)
+
+    def test_a_document_that_does_not_state_the_floor_is_caught(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            run_dir, report = self._fixture(tmp)
+            doc = tmp / "doc.md"
+            doc.write_text(self._doc("❌ 落在地板（±50%）内").replace("**+20%**", "**+21%**"),
+                           encoding="utf-8")
+            problems = check_floor(doc, run_dir, report)
+        self.assertTrue(problems, "an unstated noise floor passed the check")
+        self.assertTrue(any("never states the noise floor" in p for p in problems), problems)
+
+    def test_a_run_without_a_floor_cannot_be_checked_and_says_so(self):
+        """No floor is not a floor of zero -- the check must not pass silently."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            rows: list[dict] = []
+            events: dict[str, list[dict]] = {}
+            for arm, values in self.VALUES.items():
+                rows.append({
+                    "rep": 1, "arm": arm, "status": "succeeded",
+                    "steps_to_pass": values["steps"][0],
+                    "tokens_to_pass": values["tokens"][0],
+                    "total_steps": 12, "model_calls": 12, "tokens": 1000,
+                    "l1_failures": 1, "guard_catches": 0,
+                    # every repetition carries a lesson -> no silent repetition
+                    "prompts_lesson": "5/12" if arm == "R2_memory" else "0/12",
+                    "prompts_facts": "12/12" if arm == "R2_fact" else "0/12",
+                    "verdict": "绿", "suite": "绿",
+                })
+                events[f"{arm}_1"] = []
+            run_dir, report = self._fixture_rows(tmp, rows, events)
+            doc = tmp / "doc.md"
+            doc.write_text(self._doc("❌ 落在地板（±50%）内"), encoding="utf-8")
+            problems = check_floor(doc, run_dir, report)
+        self.assertTrue(problems, "a run without a noise floor passed the check")
+        self.assertTrue(any("no noise floor" in p for p in problems), problems)

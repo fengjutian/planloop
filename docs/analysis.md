@@ -36,7 +36,7 @@
 > |---|---|---|
 > | 反馈层 | 失败输出带不带诊断 | 0% → 100%，**收益能归因到"带诊断"这一环** |
 > | 判据层 | 判据抓不抓得住已知缺陷 | 仓外 33/33，模型自写 13/33 |
-> | 记忆层 | 第二次同类任务快多少 | 脚本模型上两条路径**收益重合**；换成真实模型后这条路一开始是**死的**（教训 0/12 进 prompt），修好后**装置自己被证伪**（契约猜得出来 ⇒ "没差异"有一半是装置的毛病）；判据藏住之后，知识必需的 `fee` 族测到 **已验证事实少查 50% 的档位表**（唯一在噪声之上的效应），而**成本口径落在 A/A 噪声地板（±48%/±52%）之内 ⇒ 不可报**；教训臂 5/8 次真注入却**没测出收益**（查表反而更多） |
+> | 记忆层 | 第二次同类任务快多少 | 脚本模型上两条路径**收益重合**；换成真实模型后这条路一开始是**死的**（教训 0/12 进 prompt），修好后**装置自己被证伪**（契约猜得出来 ⇒ "没差异"有一半是装置的毛病）；判据藏住之后，知识必需的 `fee` 族测到 **已验证事实少查 50% 的档位表**（唯一在噪声之上的效应），而**成本口径落在 A/A 噪声地板（±50%/±52%）之内 ⇒ 不可报**；教训臂 5/8 次真注入却**没测出收益**（查表反而更多） |
 >
 > 三者都不是"我们比别人强"，而是**"我们能说出收益来自哪一环"**。
 > 外部 harness 普遍只报一个 pass@1 数字，说不出这句话。
@@ -215,9 +215,12 @@ Fisher 单侧精确检验：B2 vs B0 `p=1.08e-3`、vs B2C `p=1.08e-3`、vs B2D `
      不能当收益报。
      ⇒ **这一轮最贵的一条教训不是关于记忆，是关于装置**：
      教训臂在**没有教训可注入**的那 3 次重复里，两臂 prompt 逐字相同，
-     而两臂相差 **±48% 步数 / ±52% tokens / ±21% 查表**——
+     而两臂相差 **±50% 步数 / ±52% tokens / ±21% 查表**——
      **A/A 地板比效应还大**。上一轮宣称的"-45% tokens"从来没对照过地板，
      它同时被污染过、也被自己的地板证伪了。
+     ⇒ **地板自己也只有 3 对重复**（逐次差 +5 / −1 / 0 步 ⇒ 95% 区间 [−249%, +349%]），
+     ⇒ 据此算出的样本量是**成本口径每臂约 286 次、行为口径约 10 次**
+     ⇒ **降噪的杠杆在"换任务族/换口径"，不在"多跑几轮"**（[memory-value-fee.md](memory-value-fee.md) §1.1）。
      ⇒ **教训臂**：教训在 5/8 次重复里真进了 prompt（92/133），
      但**没替掉任何核对**（查表 72 → 92，反而更多），成本也没省（-4%，噪声内）
      ——**没测出收益**；而且教训携带的是**契约转述**而不是**知识**，
@@ -279,7 +282,7 @@ Fisher 单侧精确检验：B2 vs B0 `p=1.08e-3`、vs B2C `p=1.08e-3`、vs B2D `
 | 实验汇总（含成本、负结果、效度威胁） | [bench-summary.md](bench-summary.md) |
 | 判据召回率（强判据 vs 弱判据、漏检分类、等价 mutant 分诊） | [fault-recall.md](fault-recall.md) ｜ 实现：`planloop/faults.py` ｜ 守卫：`tests/test_faults.py` |
 | 记忆价值（真实模型，`contract` 族 8 reps）：教训进 prompt 96/104、护栏 8/8 注入；成本 2.2 → 1.9 步；隐藏约定被打开 33 → 26 次；**但这一族的契约猜得出来，"没差异"有一半是装置的毛病** | [memory-value.md](memory-value.md) ｜ 实现：`planloop/membench.py` ｜ 守卫：`tests/test_membench.py` |
-| 记忆价值（真实模型，`fee` 族，判据真的藏住了 + 噪声地板）：**已验证事实少查 50% 的档位表**（72 → 36 次，8 次里 7 次更少，唯一在噪声之上的效应）；**成本口径（步数 -27%、tokens -21%）落在 A/A 噪声地板（±48%/±52%）之内，不能报**；**教训臂 5/8 次真注入（92/133 prompt）但没替掉任何核对**（查表 72 → 92）⇒ 没测出收益 | [memory-value-fee.md](memory-value-fee.md) ｜ 实现：`planloop/membench.py::FEE_FAMILY`、`planloop/membench_verify.py` ｜ 守卫：`tests/test_membench.py::FeeFamilyTest`、`tests/test_heldout.py` |
+| 记忆价值（真实模型，`fee` 族，判据真的藏住了 + 噪声地板）：**已验证事实少查 50% 的档位表**（72 → 36 次，8 次里 7 次更少，唯一在噪声之上的效应）；**成本口径（步数 -27%、tokens -21%）落在 A/A 噪声地板（±50%/±52%）之内，不能报**；**教训臂 5/8 次真注入（92/133 prompt）但没替掉任何核对**（查表 72 → 92）⇒ 没测出收益 | [memory-value-fee.md](memory-value-fee.md) ｜ 实现：`planloop/membench.py::FEE_FAMILY`、`planloop/membench_verify.py` ｜ 守卫：`tests/test_membench.py::FeeFamilyTest`、`tests/test_heldout.py` |
 | 第九处静默失效：模型写的 `shop/**/*.py` 触发条件永远匹配不上（`fnmatch` 无 `**` 语义）⇒ 教训臂只测到 2/5 | [bench.md](bench.md) §十九.9 ｜ 实现：`planloop/memory.py::_match_glob` ｜ 守卫：`tests/test_memory.py::DoubleStarGlobTest` |
 | 第十处：报告生成器在部分数据上除零 ⇒ 整轮已付费的实验被带走 | [bench.md](bench.md) §十九.10 ｜ 实现：`planloop/membench.py::to_markdown` ｜ 守卫：`tests/test_membench_report.py::PartialDataReportTest` |
 | 第十一处：仓外判据命令用相对路径 ⇒ 第一道任务永远不通过 ⇒ 没有教训可测 | [bench.md](bench.md) §十九.11 |
@@ -287,7 +290,10 @@ Fisher 单侧精确检验：B2 vs B0 `p=1.08e-3`、vs B2C `p=1.08e-3`、vs B2D `
 | 第十三处：隐藏判据的**契约被提前印在验收文本里** ⇒ 第一道任务有时一次做对（3/8 次没有教训）。**修法被 2 reps 试点否掉**（把契约拿走 ⇒ 模型连读 24 次同一个文件、任务 `blocked`、配对样本 0）⇒ **教训产出率由模型行为决定，装置控制不了** | [bench.md](bench.md) §十九.13 ｜ 试点：`.membench-fee17p` ｜ 守卫：`tests/test_membench.py::FeeFamilyTest::test_the_first_task_does_carry_the_contract_file` |
 | 第十四处：**发布前的门自己有洞**——canary 从没扫过第一道任务的日志（模型读判据源码恰恰发生在那儿）；"L1 失败"两个口径；"无效回复"没有列却当不一致 | [bench.md](bench.md) §十九.14 ｜ 实现：`planloop/membench_verify.py::LOG_STEMS`、`planloop/execute.py::NodeOutcome.l1_failures` ｜ 守卫：`tests/test_heldout.py::LeakDetectionTest::test_the_canary_scans_the_setup_phase_too` |
 | 第十五处：**被风险策略打断的 attempt 整块丢失**——报告只数"跑到结论的 attempt"，于是比日志少算（`fee16` 的 `R2_memory` rep 5：12 步 / 1 次失败 vs 日志的 20 步 / 2 次失败）⇒ 报告与日志对不上，却被降级成一条"旧口径不可复算"的 NOTE，**看不出原因** | [bench.md](bench.md) §十九.15 ｜ 实现：`planloop/execute.py::Executor._interrupt`、`planloop/scheduler.py::_record_interrupted`（进 `result.interrupted`，**不进 `outcomes`**——`outcomes` 的长度是变异测试的"跑完了的执行器次数"）、`planloop/membench_verify.py::log_steps` ｜ 守卫：`tests/test_interrupted_attempt.py`、`tests/test_membench.py::VerifyTest::test_a_dropped_attempt_is_flagged_with_its_cause` |
+| 文档层的门 + 样本量工具：逐次表/行为表**逐格**核验；**效应不得小于噪声地板**（fee9 那个错现在被机器拦着）；地板的 95% 区间与"要跑几次"（成本口径每臂 ~286 次、行为口径 ~10 次）⇒ 降噪的杠杆在换口径/换族，不在多跑 | [memory-value-fee.md](memory-value-fee.md) §1.1 ｜ 实现：`planloop/membench_publish.py`、`planloop/membench_power.py` ｜ 守卫：`tests/test_membench.py::FloorLintTest`、`tests/test_membench_power.py` |
+| 门必须能说"不"：CLI 退出码此前**从未被测过**（门只在通过状态下被人看过）；报告生成器与门的解析器可能各走各的（两张同宽的表 + 只靠"第一格是数字"认行 ⇒ 门会为了错的原因变红，或什么都没查却报通过）⇒ 现在解析器只读表头为 `rep` 的那张表、读不出就报不一致 | [roadmap.md](roadmap.md)「门必须能说'不'门」 ｜ 实现：`planloop/membench_verify.py::parse_report`、`planloop/cli.py` ｜ 守卫：`tests/test_publish_chain.py`、`tests/test_membench_cli.py`、`tests/test_membench.py::ReportFormatTest` |
 | 装置自证（反证测试）：显然公式必须被仓外判据判不通过 | [bench.md](bench.md) §二十一 ｜ 守卫：`tests/test_membench.py::FeeFamilyTest::test_a_model_that_never_reads_the_file_fails` |
+| 装置自证（**族级**，新增）：每个任务族必须声明"模型能猜到的捷径"，且仓外判据必须**拒绝**它；只有知识必需的族才在"可发布"名单里 ⇒ 新族上线时不会重蹈 `contract` 族（契约猜得出来 ⇒ 整轮白跑）的覆辙 | [bench.md](bench.md) §二十一 ｜ 实现：`planloop/membench.py::Family.guessable_solution`、`PUBLISHABLE_FAMILIES` ｜ 守卫：`tests/test_membench.py::FamilyDeviceTest` |
 | 装置自证（污染自证）：每次重复的判据带唯一 canary，跑完扫事件流与工作区，命中即作废该次重复 | [bench.md](bench.md) §十九.12 ｜ 实现：`planloop/heldout.py::find_canary`、`planloop/membench_verify.py::find_contaminated` ｜ 守卫：`tests/test_heldout.py::LeakDetectionTest` |
 | 行为口径（从事件流回读"模型有没有去查那个隐藏约定"） | [bench.md](bench.md) §二十.6 ｜ 实现：`planloop/membench.py::analyze_events` ｜ CLI：`planloop membench --analyze` |
 | 记忆价值（脚本模型）：两条路径收益重合，各省 1 步 | [memory-value-scripted.md](memory-value-scripted.md) |

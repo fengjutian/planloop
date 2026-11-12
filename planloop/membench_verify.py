@@ -165,13 +165,28 @@ def parse_report(report_path: Path) -> list[RunRow]:
     parse) so that the wasted steps are published per repetition and can be
     cross-checked against the event log.  Both widths are accepted: a report
     from an older run has 14 cells, a current one has 15.
+
+    Only the **per-rep table** is read -- it is the one whose header starts
+    with ``rep``.  The report has another table (the per-arm summary) of the
+    same width, so without that anchor a summary row whose first cell happens
+    to be a number would be read as a repetition -- and the gate would then
+    compare the wrong numbers and go red for the wrong reason.  A report with
+    no per-rep table yields no rows, and :func:`recompute` says so loudly.
     """
     rows: list[RunRow] = []
+    in_table = False
     for line in report_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line.startswith("|"):
+            if in_table:
+                break
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
+        if cells[0] == "rep":
+            in_table = True
+            continue
+        if not in_table:
+            continue
         if len(cells) not in (14, 15) or not _REPORT_ROW.match(cells[0]):
             continue
         if len(cells) == 15:
@@ -322,6 +337,14 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
     """Re-derive a run's published aggregates from its raw artifacts."""
     rows = parse_report(report_path)
     out = Recomputed()
+    if not rows:
+        # a report the gate cannot read is a report it cannot check -- and a
+        # gate that silently checks nothing is the "gate that always says
+        # pass" this project already paid for once
+        out.mismatches.append(
+            "the machine report has no per-rep table (a header row whose first "
+            "cell is 'rep') -- there is nothing to cross-check"
+        )
 
     # -- contamination: did the model read the held-out criterion? ---------
     out.contaminated = find_contaminated(run_dir, rows)
@@ -487,6 +510,10 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
     silent_reps = [r for r in out.paired_reps if r not in out.lesson_paired_reps]
     if silent_reps:
         floor: dict[str, Any] = {"reps": silent_reps}
+        #: the **unrounded** means.  The percentage below has to be computed
+        #: from them: rounding first (2.667 -> 2.7) turned a 50% floor into
+        #: 48% on the real run, and the floor is a headline number.
+        raw: dict[str, dict[str, float]] = {}
         for arm, label in (("no_memory", "R2_none"), ("lesson_and_guard", "R2_memory")):
             rows_here = [r for r in by_arm.get(label, []) if r.rep in silent_reps]
             if not rows_here:
@@ -496,6 +523,7 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
             looks = sum(
                 out.stats.get((label, r.rep), EventStats()).hidden_looks for r in rows_here
             )
+            raw[arm] = {"steps": steps, "tokens": tokens, "hidden": float(looks)}
             floor[arm] = {
                 "n": len(rows_here),
                 "steps_to_pass": round(steps, 1),
@@ -503,13 +531,10 @@ def recompute(run_dir: Path, report_path: Path, family: Family) -> Recomputed:
                 "hidden_looks": looks,
             }
         if "no_memory" in floor and "lesson_and_guard" in floor:
-            c, m = floor["no_memory"], floor["lesson_and_guard"]
-            floor["steps_delta_pct"] = _pct(m["steps_to_pass"] - c["steps_to_pass"],
-                                            c["steps_to_pass"])
-            floor["tokens_delta_pct"] = _pct(m["tokens_to_pass"] - c["tokens_to_pass"],
-                                             c["tokens_to_pass"])
-            floor["hidden_delta_pct"] = _pct(m["hidden_looks"] - c["hidden_looks"],
-                                             c["hidden_looks"])
+            c, m = raw["no_memory"], raw["lesson_and_guard"]
+            floor["steps_delta_pct"] = _pct(m["steps"] - c["steps"], c["steps"])
+            floor["tokens_delta_pct"] = _pct(m["tokens"] - c["tokens"], c["tokens"])
+            floor["hidden_delta_pct"] = _pct(m["hidden"] - c["hidden"], c["hidden"])
         out.noise_floor = floor
 
     return out

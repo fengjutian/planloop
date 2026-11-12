@@ -36,6 +36,20 @@ from planloop.verify import VerificationReport, Verifier
 from planloop.workspace import GitError, GitWorkspace
 
 
+def all_attempts(result: "RunResult") -> list[NodeOutcome]:
+    """Every attempt that ran -- including the ones a policy check cut short.
+
+    An interrupted attempt spent steps and recorded L1 failures, and the
+    event log has both; an attempt that is not counted here is a number the
+    log and the report disagree about (2026-11-12: the fifteenth defect).
+
+    It is **not** the same as ``result.outcomes``: that list holds the
+    attempts that ran to a verdict, and its length is what the mutation bench
+    counts as *completed executor runs*.
+    """
+    return list(result.outcomes) + list(getattr(result, "interrupted", []))
+
+
 def _record_interrupted(result: RunResult, exc: Exception) -> None:
     """Record the outcome of an attempt that a policy check cut short.
 
